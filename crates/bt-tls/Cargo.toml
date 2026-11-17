@@ -1,0 +1,7 @@
+[package]
+name = "bt-tls"
+version = "0.1.0"
+edition = "2021"
+description = "From-scratch crypto primitives and a TLS 1.3 client (no dependencies)."
+
+[dependencies]

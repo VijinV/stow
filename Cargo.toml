@@ -1,0 +1,29 @@
+[workspace]
+members = ["crates/bt-tls", "crates/bt-s3", "crates/bt-gui"]
+resolver = "2"
+
+[package]
+name = "backup-taker"
+version = "0.1.0"
+edition = "2021"
+description = "Back up local folders to Amazon S3 (or any S3-compatible storage)."
+license = "MIT"
+
+# No third-party crates: everything below is part of this repository.
+[dependencies]
+bt-tls = { path = "crates/bt-tls" }
+bt-s3 = { path = "crates/bt-s3" }
+bt-gui = { path = "crates/bt-gui" }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

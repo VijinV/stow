@@ -1,0 +1,8 @@
+[package]
+name = "bt-s3"
+version = "0.1.0"
+edition = "2021"
+description = "From-scratch HTTP/1.1 client and S3 API client with SigV4 signing."
+
+[dependencies]
+bt-tls = { path = "../bt-tls" }
