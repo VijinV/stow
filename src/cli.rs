@@ -5,7 +5,8 @@ use crate::timefmt::{human_bytes, human_duration};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const HELP: &str = "Backup Taker — back up folders to Amazon S3 / S3-compatible storage
+pub const HELP: &str = "Stow — Your files, safely kept.
+Back up folders to Amazon S3 / S3-compatible storage
 
 Usage:
   backup-taker                     Open the app

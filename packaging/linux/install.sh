@@ -8,4 +8,4 @@ install -m755 backup-taker "$BIN/backup-taker"
 install -m644 icon-256.png "$ICONS/backup-taker.png"
 sed "s|^Exec=.*|Exec=$BIN/backup-taker|" backup-taker.desktop > "$APPS/backup-taker.desktop"
 command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database -q "$APPS" || true
-echo "Installed. Open 'Backup Taker' from your applications menu, or run $BIN/backup-taker"
+echo "Installed. Open 'Stow' from your applications menu, or run $BIN/backup-taker"

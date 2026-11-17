@@ -28,7 +28,7 @@ Section: utils
 Priority: optional
 Architecture: $ARCH
 Installed-Size: $SIZE_KB
-Maintainer: Backup Taker <noreply@backuptaker.invalid>
+Maintainer: Stow <noreply@backuptaker.invalid>
 Description: Back up folders to Amazon S3 or S3-compatible storage
  Desktop app that backs up the folders you choose to an S3 bucket,
  incrementally, with optional automatic schedules.

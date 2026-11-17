@@ -36,7 +36,7 @@ jobs:
         run: |
           $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target\x86_64-pc-windows-msvc\release\backup-taker.exe "dist\BackupTaker-$v-windows-x64-portable.exe"
+          Copy-Item target\x86_64-pc-windows-msvc\release\backup-taker.exe "dist\Stow-$v-windows-x64-portable.exe"
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DVersion=$v" packaging\windows\installer.iss
       - uses: actions/upload-artifact@v4
         with: { name: windows, path: dist/* }

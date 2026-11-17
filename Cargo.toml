@@ -4,9 +4,9 @@ resolver = "2"
 
 [package]
 name = "backup-taker"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
-description = "Back up local folders to Amazon S3 (or any S3-compatible storage)."
+description = "Stow — Your files, safely kept. Back up folders to S3-compatible storage."
 license = "MIT"
 
 # No third-party crates: everything below is part of this repository.

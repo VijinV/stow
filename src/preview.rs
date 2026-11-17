@@ -246,7 +246,7 @@ fn viewer(name: &str, token: &str, kind: Kind, text: Option<&str>) -> String {
         Kind::Pdf => format!("<iframe title=\"PDF preview\" src=\"{source}\"></iframe>"),
         Kind::Text => format!("<pre>{}</pre>", escape(text.unwrap_or_default())),
     };
-    format!("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><title>Backup Taker preview</title><style>body{{background:#18202b;color:#e8edf4;font:16px system-ui;margin:24px}}h1{{font-size:20px;overflow-wrap:anywhere}}img,video{{max-width:100%;max-height:80vh}}iframe{{width:100%;height:80vh;border:0}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}p{{color:#adb9c9}}</style></head><body><h1>{}</h1><p>Private preview · expires after 15 minutes · browser codec support may vary</p>{content}</body></html>", escape(name))
+    format!("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><title>Stow preview</title><style>body{{background:#18202b;color:#e8edf4;font:16px system-ui;margin:24px}}h1{{font-size:20px;overflow-wrap:anywhere}}img,video{{max-width:100%;max-height:80vh}}iframe{{width:100%;height:80vh;border:0}}pre{{white-space:pre-wrap;overflow-wrap:anywhere}}p{{color:#adb9c9}}</style></head><body><h1>{}</h1><p>Private preview · expires after 15 minutes · browser codec support may vary</p>{content}</body></html>", escape(name))
 }
 
 /// Single RFC 7233 byte range, inclusive. Multi-range requests are rejected.

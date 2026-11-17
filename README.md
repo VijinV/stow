@@ -1,4 +1,6 @@
-# Backup Taker
+# Stow
+
+**Your files, safely kept.**
 
 A Rust desktop app for backing up folders to Amazon S3 and S3-compatible storage. No third-party Rust crates: the GUI, HTTP/S3 client, TLS implementation and file encryption are implemented in this repository.
 

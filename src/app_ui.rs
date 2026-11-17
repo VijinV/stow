@@ -443,7 +443,7 @@ impl App {
 
 pub fn run() -> std::io::Result<()> {
     let opts = WindowOptions {
-        title: "Backup Taker".into(),
+        title: "Stow".into(),
         width: 1040,
         height: 700,
         min_width: 820,
@@ -488,10 +488,12 @@ fn frame(ui: &mut Ui, app: &mut App) {
             let r = ui.allocate(Some(34.0), 34.0);
             let accent = ui.theme.accent;
             ui.canvas.fill_rounded_rect(r, 8.0, accent);
-            ui.paint_text_centered(r, "BT", 14.0, Color::WHITE, true);
-            ui.subheading("Backup Taker");
+            ui.paint_text_centered(r, "S", 14.0, Color::WHITE, true);
+            ui.subheading("Stow");
         });
-        ui.space(16.0);
+        ui.space(6.0);
+        ui.small("Your files, safely kept.");
+        ui.space(12.0);
         ui.set_spacing(4.0);
         let items = [
             (Icon::Home, "Overview", Page::Overview),
@@ -1094,7 +1096,7 @@ fn storage_page(ui: &mut Ui, app: &mut App) {
     page_header(ui, "Storage", "The S3 bucket your backups are stored in.");
     ui.callout(
         Tone::Info,
-        "S3 has no one-click “Sign in” for desktop apps, so Backup Taker uses an Access Key. Create one in the AWS console (IAM → Users → Security credentials → Create access key) for a user that can read and write your bucket.",
+        "S3 has no one-click “Sign in” for desktop apps, so Stow uses an Access Key. Create one in the AWS console (IAM → Users → Security credentials → Create access key) for a user that can read and write your bucket.",
     );
     ui.space(4.0);
     let d = &mut app.draft;

@@ -40,7 +40,7 @@ fn main() {
     let result = app_ui::run();
     preview::shutdown();
     if let Err(err) = result {
-        eprintln!("Could not open Backup Taker: {err}");
+        eprintln!("Could not open Stow: {err}");
         std::process::exit(1);
     }
 }

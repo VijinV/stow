@@ -154,7 +154,7 @@ mod os {
             std::fs::write(
                 &svc,
                 format!(
-                    "[Unit]\nDescription=Backup Taker scheduled backup\n\n[Service]\nType=oneshot\nExecStart={} --run-scheduled\nNice=10\nIOSchedulingClass=idle\n",
+                    "[Unit]\nDescription=Stow scheduled backup\n\n[Service]\nType=oneshot\nExecStart={} --run-scheduled\nNice=10\nIOSchedulingClass=idle\n",
                     quote(&exe)
                 ),
             )
@@ -162,7 +162,7 @@ mod os {
             std::fs::write(
                 &timer,
                 format!(
-                    "[Unit]\nDescription=Backup Taker schedule\n\n[Timer]\nOnCalendar={}\nPersistent=true\nRandomizedDelaySec=60\n\n[Install]\nWantedBy=timers.target\n",
+                    "[Unit]\nDescription=Stow schedule\n\n[Timer]\nOnCalendar={}\nPersistent=true\nRandomizedDelaySec=60\n\n[Install]\nWantedBy=timers.target\n",
                     on_calendar(cfg)
                 ),
             )
