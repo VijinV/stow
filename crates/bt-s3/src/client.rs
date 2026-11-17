@@ -42,6 +42,8 @@ pub struct UploadOptions {
     pub content_type: Option<String>,
     pub metadata: Vec<(String, String)>,
     pub storage_class: Option<String>,
+    pub server_encryption: Option<String>,
+    pub kms_key_id: Option<String>,
 }
 
 impl Default for UploadOptions {
@@ -52,7 +54,23 @@ impl Default for UploadOptions {
             content_type: None,
             metadata: Vec::new(),
             storage_class: None,
+            server_encryption: None,
+            kms_key_id: None,
         }
+    }
+}
+
+impl UploadOptions {
+    pub fn validate(&self) -> Result<(), String> {
+        let algorithm = self.server_encryption.as_deref().unwrap_or("");
+        if !matches!(algorithm, "" | "AES256" | "aws:kms") {
+            return Err("S3 encryption must be bucket default, AES256, or aws:kms.".into());
+        }
+        if let Some(key) = self.kms_key_id.as_deref().filter(|k| !k.is_empty()) {
+            if algorithm != "aws:kms" { return Err("A KMS key requires aws:kms encryption.".into()); }
+            if key.chars().any(|c| c.is_control()) { return Err("Invalid KMS key ID.".into()); }
+        }
+        Ok(())
     }
 }
 
@@ -414,6 +432,12 @@ impl S3Client {
     fn object_headers(c: &mut Call, ct: Option<&str>, opts: Option<&UploadOptions>) {
         c.headers.push(("content-type".into(), ct.unwrap_or("application/octet-stream").into()));
         if let Some(o) = opts {
+            if let Some(algorithm) = o.server_encryption.as_ref().filter(|a| !a.is_empty()) {
+                c.headers.push(("x-amz-server-side-encryption".into(), algorithm.clone()));
+            }
+            if let Some(key) = o.kms_key_id.as_ref().filter(|k| !k.is_empty()) {
+                c.headers.push(("x-amz-server-side-encryption-aws-kms-key-id".into(), key.clone()));
+            }
             for (k, v) in &o.metadata {
                 c.headers.push((format!("x-amz-meta-{}", k.to_ascii_lowercase()), v.clone()));
             }
@@ -443,6 +467,7 @@ impl S3Client {
         progress: &mut dyn FnMut(u64),
         cancel: &AtomicBool,
     ) -> Result<String, S3Error> {
+        opts.validate().map_err(|e| S3Error::new(0, "InvalidEncryption", e))?;
         let size = fs::metadata(path).map_err(|e| S3Error::local(&e))?.len();
         let ct = opts.content_type.as_deref();
         if size < opts.multipart_threshold.max(5 * 1024 * 1024) {
@@ -538,6 +563,14 @@ impl S3Client {
             Err(e) if e.status == 404 => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// User metadata for an object, with the x-amz-meta- prefix removed.
+    pub fn object_metadata(&self, key: &str) -> Result<Vec<(String, String)>, S3Error> {
+        let response = self.call_simple(&Call::new("HEAD", Target::Object(key)))?;
+        Ok(response.headers.into_iter().filter_map(|(name, value)| {
+            name.to_ascii_lowercase().strip_prefix("x-amz-meta-").map(|key| (key.to_string(), value))
+        }).collect())
     }
 
     /// One page of ListObjectsV2. Returns (objects, next continuation token).
@@ -687,6 +720,54 @@ mod tests {
             S3Config { endpoint: endpoint.into(), bucket: bucket.into(), path_style, ..Default::default() },
             Arc::new(NoTls),
         )
+    }
+
+    #[test]
+    fn sse_headers_reach_http_put_and_multipart_creation() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for step in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut header = Vec::new();
+                while !header.ends_with(b"\r\n\r\n") {
+                    let mut b = [0]; stream.read_exact(&mut b).unwrap(); header.push(b[0]);
+                }
+                let header = String::from_utf8(header).unwrap().to_ascii_lowercase();
+                let length: u64 = header.lines().find_map(|l| l.strip_prefix("content-length:").map(|v| v.trim().parse().unwrap())).unwrap_or(0);
+                std::io::copy(&mut (&mut stream).take(length), &mut std::io::sink()).unwrap();
+                if step == 0 || step == 1 {
+                    assert!(header.contains("x-amz-server-side-encryption: aws:kms"), "{header}");
+                    assert!(header.contains("x-amz-server-side-encryption-aws-kms-key-id: test-key"), "{header}");
+                }
+                let body = match step { 1 => "<InitiateMultipartUploadResult><UploadId>u</UploadId></InitiateMultipartUploadResult>", 3 => "<CompleteMultipartUploadResult><ETag>done</ETag></CompleteMultipartUploadResult>", _ => "" };
+                let meta = if step == 4 { "x-amz-meta-bt-encrypted: BTENC001\r\n" } else { "" };
+                write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\nETag: e\r\n{}\r\n{}", body.len(), meta, body).unwrap();
+            }
+        });
+        let path = std::env::temp_dir().join(format!("bt-sse-{}", bt_tls::crypto::util::hex(&bt_tls::crypto::random::array::<16>().unwrap())));
+        let c = client(&endpoint, "bucket", true);
+        let opts = UploadOptions { server_encryption: Some("aws:kms".into()), kms_key_id: Some("test-key".into()), multipart_threshold: 5 * 1024 * 1024, ..Default::default() };
+        for size in [1, 5 * 1024 * 1024] {
+            fs::write(&path, vec![7; size]).unwrap();
+            c.upload_file("key", &path, &opts, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        }
+        assert_eq!(c.object_metadata("key").unwrap(), vec![("bt-encrypted".into(), "BTENC001".into())]);
+        fs::remove_file(path).unwrap(); server.join().unwrap();
+    }
+
+    #[test]
+    fn encryption_headers_for_put_and_multipart_initiation() {
+        let opts = UploadOptions { server_encryption: Some("aws:kms".into()), kms_key_id: Some("arn:aws:kms:key/test".into()), ..Default::default() };
+        for method in ["PUT", "POST"] {
+            let mut c = Call::new(method, Target::Object("k"));
+            S3Client::object_headers(&mut c, None, Some(&opts));
+            assert!(c.headers.contains(&("x-amz-server-side-encryption".into(), "aws:kms".into())));
+            assert!(c.headers.contains(&("x-amz-server-side-encryption-aws-kms-key-id".into(), "arn:aws:kms:key/test".into())));
+        }
+        assert!(UploadOptions { server_encryption: Some("bad".into()), ..Default::default() }.validate().is_err());
+        assert!(UploadOptions { kms_key_id: Some("key".into()), ..Default::default() }.validate().is_err());
     }
 
     #[test]

@@ -1,12 +1,19 @@
 // No console window for the GUI app on Windows; CLI mode re-attaches to the parent console.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod app_ui;
+mod browse;
+mod browser_ui;
 mod cli;
 mod config;
 mod engine;
+#[cfg(test)]
+mod feature_tests;
+mod file_crypto;
 mod glob;
 mod json;
 mod paths;
+mod preview;
 mod remote;
 mod schedule;
 mod secret;
@@ -30,5 +37,10 @@ fn main() {
         attach_console();
         std::process::exit(cli::run(&args));
     }
-    eprintln!("GUI not wired yet");
+    let result = app_ui::run();
+    preview::shutdown();
+    if let Err(err) = result {
+        eprintln!("Could not open Backup Taker: {err}");
+        std::process::exit(1);
+    }
 }

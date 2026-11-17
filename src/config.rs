@@ -20,6 +20,10 @@ pub struct S3Settings {
     pub storage_class: String,
     /// Extra trusted CA certificate (PEM) for self-hosted endpoints.
     pub ca_file: String,
+    pub client_encryption: bool,
+    pub recovery_key: String,
+    pub server_encryption: String,
+    pub kms_key_id: String,
 }
 
 impl S3Settings {
@@ -116,6 +120,10 @@ impl Config {
             path_style: s3.bool_or("path_style", false),
             storage_class: s3.str_or("storage_class", ""),
             ca_file: s3.str_or("ca_file", ""),
+            client_encryption: s3.bool_or("client_encryption", false),
+            recovery_key: secret::unprotect(&s3.str_or("recovery_key", "")),
+            server_encryption: s3.str_or("server_encryption", ""),
+            kms_key_id: s3.str_or("kms_key_id", ""),
         };
         let folders = j
             .arr("folders")
@@ -160,6 +168,10 @@ impl Config {
         s3.set("path_style", self.s3.path_style);
         s3.set("storage_class", self.s3.storage_class.as_str());
         s3.set("ca_file", self.s3.ca_file.as_str());
+        s3.set("client_encryption", self.s3.client_encryption);
+        s3.set("recovery_key", secret::protect(&self.s3.recovery_key, &format!("{}:recovery-key", self.s3.access_key.trim())));
+        s3.set("server_encryption", self.s3.server_encryption.as_str());
+        s3.set("kms_key_id", self.s3.kms_key_id.as_str());
         let mut j = Json::obj();
         j.set("version", 1u32);
         j.set("s3", s3);
@@ -259,6 +271,10 @@ mod tests {
         c.s3.access_key = "AK".into();
         c.s3.secret_key = "se/cr+et".into();
         c.s3.prefix = "/backups/".into();
+        c.s3.client_encryption = true;
+        c.s3.recovery_key = "ab".repeat(32);
+        c.s3.server_encryption = "aws:kms".into();
+        c.s3.kms_key_id = "key-id".into();
         c.device_name = "laptop".into();
         assert!(c.add_folder("/home/u/Documents/"));
         assert!(!c.add_folder("/home/u/Documents"));

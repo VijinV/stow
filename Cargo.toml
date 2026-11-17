@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "backup-taker"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Back up local folders to Amazon S3 (or any S3-compatible storage)."
 license = "MIT"

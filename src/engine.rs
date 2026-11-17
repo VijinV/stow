@@ -186,6 +186,7 @@ pub struct IndexEntry {
 pub struct UploadIndex {
     pub path: PathBuf,
     pub entries: HashMap<String, IndexEntry>,
+    policy: String,
 }
 
 fn esc(s: &str) -> String {
@@ -220,8 +221,10 @@ impl UploadIndex {
 
     pub fn load(path: PathBuf) -> UploadIndex {
         let mut entries = HashMap::new();
+        let mut policy = String::new();
         if let Ok(s) = std::fs::read_to_string(&path) {
             for line in s.lines() {
+                if let Some(value) = line.strip_prefix("# encryption-policy:") { policy = value.to_string(); continue; }
                 let f: Vec<&str> = line.split('\t').collect();
                 if f.len() == 4 {
                     if let (Ok(size), Ok(mt)) = (f[1].parse(), f[2].parse()) {
@@ -230,11 +233,21 @@ impl UploadIndex {
                 }
             }
         }
-        UploadIndex { path, entries }
+        UploadIndex { path, entries, policy }
+    }
+
+    fn load_for_path(path: PathBuf, cfg: &Config) -> UploadIndex {
+        let key = if cfg.s3.client_encryption { cfg.s3.recovery_key.trim().to_ascii_lowercase() } else { String::new() };
+        let policy = format!("{}|{}|{}|{}", cfg.s3.client_encryption, key, cfg.s3.server_encryption.trim(), cfg.s3.kms_key_id.trim());
+        let policy = bt_tls::crypto::util::hex(&bt_tls::crypto::sha256::sha256(policy.as_bytes()));
+        let mut index = Self::load(path);
+        if index.policy != policy { index.entries.clear(); index.policy = policy; }
+        index
     }
 
     pub fn save(&self) -> std::io::Result<()> {
         let mut s = String::with_capacity(self.entries.len() * 80);
+        if !self.policy.is_empty() { s.push_str(&format!("# encryption-policy:{}\n", self.policy)); }
         let mut keys: Vec<&String> = self.entries.keys().collect();
         keys.sort();
         for k in keys {
@@ -461,6 +474,12 @@ impl Shared {
 
 /// Run a complete backup. Blocks until finished. Progress is published in `shared`.
 pub fn run_backup(cfg: &Config, storage: Arc<dyn Storage>, shared: Arc<Shared>, trigger: &str) -> Progress {
+    run_backup_mode(cfg, storage, shared, trigger, false)
+}
+pub fn run_backup_full(cfg: &Config, storage: Arc<dyn Storage>, shared: Arc<Shared>, trigger: &str) -> Progress {
+    run_backup_mode(cfg, storage, shared, trigger, true)
+}
+fn run_backup_mode(cfg: &Config, storage: Arc<dyn Storage>, shared: Arc<Shared>, trigger: &str, full: bool) -> Progress {
     shared.cancel.store(false, Ordering::SeqCst);
     {
         let mut p = shared.progress.lock().unwrap();
@@ -495,7 +514,10 @@ pub fn run_backup(cfg: &Config, storage: Arc<dyn Storage>, shared: Arc<Shared>, 
 
     // --- scan
     let index_path = UploadIndex::path_for(cfg);
-    let index = Arc::new(Mutex::new(UploadIndex::load(index_path)));
+    let index = UploadIndex::load_for_path(index_path, cfg);
+    // Persist invalidation before replacing any remote object, including interrupted runs.
+    if let Err(e) = index.save() { return finish(Phase::Failed, format!("Could not save upload index: {}", e)); }
+    let index = Arc::new(Mutex::new(index));
     let mut queue: VecDeque<FileJob> = VecDeque::new();
     let mut last_beat = Instant::now();
     for f in &folders {
@@ -518,7 +540,7 @@ pub fn run_backup(cfg: &Config, storage: Arc<dyn Storage>, shared: Arc<Shared>, 
                 let mut p = shared.progress.lock().unwrap();
                 p.files_found += 1;
                 let unchanged = idx.entries.get(&job.key).map(|e| e.size == job.size && e.mtime_ns == job.mtime_ns).unwrap_or(false);
-                if unchanged {
+                if unchanged && !full {
                     p.files_skipped += 1;
                 } else {
                     p.files_to_upload += 1;
@@ -758,12 +780,33 @@ mod tests {
         assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"hello again");
         assert_eq!(load_history().len(), 3);
 
+        let full = run_backup_full(&cfg, storage.clone(), shared.clone(), "test-full");
+        assert_eq!(full.files_uploaded, 3);
+        assert_eq!(full.files_skipped, 0);
+
         // A held lock blocks a concurrent run.
         let l = RunLock::acquire().unwrap();
         let p4 = run_backup(&cfg, storage.clone(), shared.clone(), "test");
         assert_eq!(p4.phase, Phase::Failed);
         drop(l);
         std::env::remove_var("BACKUP_TAKER_HOME");
+    }
+
+    #[test]
+    fn encryption_policy_invalidates_index_on_every_transition() {
+        let d = tmpdir("policy"); let path = d.join("index.tsv");
+        let mut cfg = Config::default();
+        let mut first = UploadIndex::load_for_path(path.clone(), &cfg);
+        first.entries.insert("file".into(), IndexEntry { size: 5, mtime_ns: 1, etag: "e".into() });
+        first.save().unwrap();
+        assert_eq!(UploadIndex::load_for_path(path.clone(), &cfg).entries.len(), 1);
+        cfg.s3.client_encryption = true; cfg.s3.recovery_key = "ab".repeat(32);
+        let mut second = UploadIndex::load_for_path(path.clone(), &cfg);
+        assert!(second.entries.is_empty());
+        second.entries.insert("file".into(), IndexEntry { size: 5, mtime_ns: 1, etag: "encrypted".into() });
+        second.save().unwrap();
+        cfg.s3.client_encryption = false;
+        assert!(UploadIndex::load_for_path(path, &cfg).entries.is_empty());
     }
 
     #[test]

@@ -56,7 +56,20 @@ pub fn s3_config(s: &S3Settings) -> S3Config {
     }
 }
 
+pub fn validate_encryption(s: &S3Settings) -> Result<(), String> {
+    if s.client_encryption { crate::file_crypto::validate_key(&s.recovery_key)?; }
+    encryption_options(s).validate()
+}
+fn encryption_options(s: &S3Settings) -> UploadOptions {
+    UploadOptions {
+        server_encryption: (!s.server_encryption.trim().is_empty()).then(|| s.server_encryption.trim().to_string()),
+        kms_key_id: (!s.kms_key_id.trim().is_empty()).then(|| s.kms_key_id.trim().to_string()),
+        ..Default::default()
+    }
+}
+
 pub fn client(s: &S3Settings) -> Result<S3Client, String> {
+    validate_encryption(s)?;
     let cfg = s3_config(s);
     S3Client::validate_config(&cfg)?;
     let tls = Arc::new(BtTls { roots: roots(&s.ca_file)? });
@@ -84,16 +97,17 @@ pub fn list_buckets(s: &S3Settings) -> Result<Vec<String>, String> {
 pub struct S3Storage {
     client: S3Client,
     opts: UploadOptions,
+    recovery_key: Option<String>,
 }
 
 impl S3Storage {
     pub fn new(cfg: &Config) -> Result<S3Storage, String> {
         let client = client(&cfg.s3)?;
-        let mut opts = UploadOptions::default();
+        let mut opts = encryption_options(&cfg.s3);
         if !cfg.s3.storage_class.trim().is_empty() {
             opts.storage_class = Some(cfg.s3.storage_class.trim().to_string());
         }
-        Ok(S3Storage { client, opts })
+        Ok(S3Storage { client, opts, recovery_key: cfg.s3.client_encryption.then(|| cfg.s3.recovery_key.clone()) })
     }
 }
 
@@ -111,6 +125,32 @@ impl Storage for S3Storage {
     fn upload_file(&self, key: &str, path: &Path, progress: &mut dyn FnMut(u64), cancel: &AtomicBool) -> Result<String, String> {
         let mut opts = self.opts.clone();
         opts.metadata = mtime_meta(path);
-        self.client.upload_file(key, path, &opts, progress, cancel).map_err(|e| e.to_string())
+        if let Some(recovery_key) = &self.recovery_key {
+            let (temp, file) = crate::file_crypto::private_temp(&std::env::temp_dir())?;
+            drop(file);
+            crate::file_crypto::encrypt_file_cancel(path, &temp.0, recovery_key, cancel)?;
+            opts.metadata.push(("bt-encrypted".into(), "BTENC001".into()));
+            self.client.upload_file(key, &temp.0, &opts, progress, cancel).map_err(|e| e.to_string())
+        } else {
+            self.client.upload_file(key, path, &opts, progress, cancel).map_err(|e| e.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn refuses_bad_encryption_configuration_before_network_access() {
+        let mut settings = S3Settings::default();
+        settings.client_encryption = true;
+        assert!(validate_encryption(&settings).is_err());
+        settings.recovery_key = "ab".repeat(32);
+        assert!(validate_encryption(&settings).is_ok());
+        settings.server_encryption = "AES256".into();
+        settings.kms_key_id = "key".into();
+        assert!(validate_encryption(&settings).is_err());
+        settings.server_encryption = "aws:kms".into();
+        assert!(validate_encryption(&settings).is_ok());
     }
 }
