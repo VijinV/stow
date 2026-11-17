@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Backup Taker
+GenericName=Backup to S3
+Comment=Back up your folders to Amazon S3 or S3-compatible storage
+Exec=backup-taker
+Icon=backup-taker
+Terminal=false
+Categories=Utility;Archiving;
+Keywords=backup;s3;aws;cloud;
+StartupWMClass=backup-taker
