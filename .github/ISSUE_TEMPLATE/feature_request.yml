@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest an improvement to Stow or the dashboard
+body:
+  - type: textarea
+    id: workflow
+    attributes:
+      label: What are you trying to do?
+      description: Describe your workflow and what is difficult today.
+    validations:
+      required: true
+  - type: textarea
+    id: improvement
+    attributes:
+      label: What should Stow do differently?
+    validations:
+      required: true

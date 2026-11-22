@@ -28,16 +28,19 @@ This first slice uses a local admin token and a single SQLite instance. An inter
 
 ## Run with Docker
 
-Build from the repository root with `docker build -t stow-dashboard:0.3.0 dashboard`, or pull the published image from `registry.wbx.previewbay.com/stow-dashboard:0.3.0` after signing in to the registry.
+Build the dashboard from the repository root. The public source build uses the same Dockerfile as the published image.
 
 ```sh
+docker build -t stow-dashboard:local dashboard
 export STOW_ADMIN_TOKEN="$(openssl rand -hex 32)"
 docker run --rm --name stow-dashboard \
   -p 127.0.0.1:8787:8787 \
   --env STOW_ADMIN_TOKEN \
   --mount type=volume,source=stow-dashboard-data,target=/var/lib/stow \
-  registry.wbx.previewbay.com/stow-dashboard:0.3.0
+  stow-dashboard:local
 ```
+
+If you already have access to the release registry, you can pull `registry.wbx.previewbay.com/stow-dashboard:0.3.0` and use that image in the run command. The published image targets Linux amd64.
 
 Use the same admin token on subsequent starts. The named volume stores the database. If you use a bind mount instead, make the data directory writable by container UID and GID 10001. Configure AWS workload identity and `STOW_AWS_SESSIONS=1` at runtime to issue storage sessions.
 

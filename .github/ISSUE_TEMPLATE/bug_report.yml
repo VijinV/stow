@@ -1,0 +1,31 @@
+name: Bug report
+description: Report something that went wrong in Stow or the dashboard
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Stow or dashboard version
+      placeholder: 0.3.0
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system, storage provider, and backup mode
+      description: Include whether you use standalone or dashboard-managed backups, if applicable.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Describe the smallest sequence that triggers the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+      description: Include relevant error messages. Remove tokens, keys, and personal data.
+    validations:
+      required: true
