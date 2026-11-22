@@ -12,12 +12,17 @@ mod feature_tests;
 mod file_crypto;
 mod glob;
 mod json;
+mod managed;
+mod managed_ui;
+mod dashboard_api;
 mod paths;
 mod preview;
 mod remote;
 mod schedule;
 mod secret;
 mod timefmt;
+mod verify;
+mod verify_ui;
 
 #[cfg(windows)]
 fn attach_console() {
@@ -44,3 +49,6 @@ fn main() {
         std::process::exit(1);
     }
 }
+
+#[cfg(test)]
+mod managed_tests;

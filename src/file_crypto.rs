@@ -8,6 +8,12 @@ const MAGIC: &[u8; 8] = b"BTENC001";
 const CHUNK: usize = 64 * 1024;
 const HEADER: usize = 40; // magic + random 256-bit salt
 
+pub(crate) fn encrypted_size(source_size: u64) -> u64 {
+    // Each data frame and the final empty frame store a length and an authentication tag.
+    let frames = source_size.div_ceil(CHUNK as u64) + 1;
+    source_size.saturating_add(HEADER as u64 + frames * 20)
+}
+
 pub fn generate_key() -> Result<String, String> {
     Ok(util::hex(
         &random::array::<32>().map_err(|e| e.to_string())?,
@@ -285,10 +291,11 @@ mod tests {
     fn envelope_roundtrips_empty_and_multiple_chunks() {
         let d = dir();
         let key = generate_key().unwrap();
-        for n in [0, 1, 180_001] {
+        for n in [0, 1, CHUNK, CHUNK + 1, 180_001] {
             let data: Vec<_> = (0..n).map(|i| (i % 251) as u8).collect();
             fs::write(d.join("in"), &data).unwrap();
             encrypt_file(&d.join("in"), &d.join("encrypted"), &key).unwrap();
+            assert_eq!(fs::metadata(d.join("encrypted")).unwrap().len(), encrypted_size(n as u64));
             assert!(is_encrypted_file(&d.join("encrypted")).unwrap());
             assert!(decrypt_file(&d.join("encrypted"), &d.join("out"), &key).unwrap());
             assert_eq!(fs::read(d.join("out")).unwrap(), data);

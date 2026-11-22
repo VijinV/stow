@@ -2,7 +2,7 @@
 use crate::config::{Config, ScheduleMode};
 use crate::engine::{self, Phase, Shared};
 use crate::timefmt::{human_bytes, human_duration};
-use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub const HELP: &str = "Stow — Your files, safely kept.
@@ -10,7 +10,10 @@ Back up folders to Amazon S3 / S3-compatible storage
 
 Usage:
   backup-taker                     Open the app
-  backup-taker --backup-now        Run a backup now (prints progress)
+  backup-taker --backup-now [--full]
+                                   Run a backup now; --full re-uploads all included files
+  backup-taker --dry-run [--full]  Estimate files and data to upload using the local index
+  backup-taker --verify           Compare recorded uploads with current objects in S3
   backup-taker --run-scheduled     Run a backup if a schedule is enabled (used by the OS scheduler)
   backup-taker --test-connection   Check the S3 settings
   backup-taker --list-buckets      List buckets visible to the configured keys
@@ -19,7 +22,7 @@ Usage:
   backup-taker --remove-folder PATH
   backup-taker --set KEY=VALUE     Change a setting. Keys: endpoint region bucket prefix access_key
                                    secret_key path_style storage_class ca_file device_name
-                                   parallel_uploads skip_hidden schedule(off|interval|daily)
+                                   parallel_uploads skip_hidden skip_dev_artifacts schedule(off|interval|daily)
                                    interval_hours daily_time
   backup-taker --version
 
@@ -36,16 +39,33 @@ pub fn run(args: &[String]) -> i32 {
             println!("backup-taker {}", env!("CARGO_PKG_VERSION"));
             0
         }
-        "--backup-now" => backup(Config::load(), "manual (command line)", true),
+        "--backup-now" | "--dry-run" => {
+            let full = match &args[1..] {
+                [] => false,
+                [flag] if flag == "--full" => true,
+                _ => {
+                    eprintln!("Usage: backup-taker {} [--full]", a);
+                    return 2;
+                }
+            };
+            let cfg = Config::load();
+            if a == "--dry-run" {
+                preview(&cfg, full)
+            } else {
+                let trigger = if full { "manual full (command line)" } else { "manual (command line)" };
+                backup(cfg, trigger, true, full)
+            }
+        }
+        "--verify" if args.len() == 1 => verify(&Config::load()),
         "--run-scheduled" => {
             let cfg = Config::load();
             if cfg.schedule == ScheduleMode::Off {
                 engine::log_line("scheduled run skipped: schedule is off");
                 return 0;
             }
-            backup(cfg, "scheduled", false)
+            backup(cfg, "scheduled", false, false)
         }
-        "--test-connection" => match crate::remote::test_connection(&Config::load().s3) {
+        "--test-connection" => match test_storage(&Config::load()) {
             Ok(s) => {
                 println!("OK: {}", s);
                 0
@@ -55,7 +75,10 @@ pub fn run(args: &[String]) -> i32 {
                 1
             }
         },
-        "--list-buckets" => match crate::remote::list_buckets(&Config::load().s3) {
+        "--list-buckets" => match crate::managed::effective_for_cli(&Config::load()).and_then(|cfg| {
+            if cfg.s3.managed.is_some() { Ok(vec![cfg.s3.bucket]) }
+            else { crate::remote::list_buckets(&cfg.s3) }
+        }) {
             Ok(b) => {
                 for x in b {
                     println!("{}", x);
@@ -121,6 +144,7 @@ pub fn run(args: &[String]) -> i32 {
                     "device_name" => cfg.device_name = crate::config::sanitize_label(v),
                     "parallel_uploads" => cfg.parallel_uploads = v.parse().unwrap_or(4).clamp(1, 16),
                     "skip_hidden" => cfg.skip_hidden = b(),
+                    "skip_dev_artifacts" => cfg.skip_dev_artifacts = b(),
                     "schedule" => {
                         cfg.schedule = match v {
                             "interval" => ScheduleMode::Interval,
@@ -165,20 +189,42 @@ fn save(cfg: &Config) -> i32 {
     }
 }
 
+fn test_storage(local: &Config) -> Result<String, String> {
+    let cfg = crate::managed::effective_for_cli(local)?;
+    if let Some(target) = &cfg.s3.managed {
+        crate::remote::scoped_client(&cfg.s3, target.read_credentials("verify"))?
+            .list_objects_page(&cfg.s3.prefix, 1, None)
+            .map_err(|error| error.to_string())?;
+        return Ok(format!("Managed destination s3://{}/{}", cfg.s3.bucket, cfg.s3.prefix));
+    }
+    crate::remote::test_connection(&cfg.s3)
+}
+
 fn status() {
     let cfg = Config::load();
     println!("Settings: {}", Config::path().display());
-    let ep = if cfg.s3.endpoint.is_empty() { "Amazon S3".to_string() } else { cfg.s3.endpoint.clone() };
-    println!("Storage:  {} bucket '{}' prefix '{}' (key {})", ep, cfg.s3.bucket, cfg.s3.prefix,
-        if cfg.s3.access_key.is_empty() { "not set".to_string() } else { cfg.s3.access_key.clone() });
+    let effective = match crate::managed::effective_for_cli(&cfg) {
+        Ok(effective) if effective.s3.managed.is_some() => {
+            println!("Storage:  dashboard-managed s3://{}/{}", effective.s3.bucket, effective.s3.prefix);
+            Some(effective)
+        }
+        Ok(_) => {
+            let ep = if cfg.s3.endpoint.is_empty() { "Amazon S3" } else { &cfg.s3.endpoint };
+            println!("Storage:  {ep} bucket '{}' prefix '{}' (key {})", cfg.s3.bucket, cfg.s3.prefix,
+                if cfg.s3.access_key.is_empty() { "not set" } else { &cfg.s3.access_key });
+            Some(cfg.clone())
+        }
+        Err(error) => { println!("Storage:  dashboard-managed · {error}"); None }
+    };
     println!("Device:   {}", cfg.device_name);
     println!("Schedule: {}", crate::schedule::describe(&cfg));
     println!("Folders:");
     for f in &cfg.folders {
-        println!("  [{}] {}  ->  {}", if f.enabled { "x" } else { " " }, f.path, cfg.remote_root(f));
+        let prefix = effective.as_ref().map(|cfg| cfg.remote_root(f)).unwrap_or_else(|| "Unavailable".into());
+        println!("  [{}] {}  ->  {}", if f.enabled { "x" } else { " " }, f.path, prefix);
     }
     if let Some(p) = engine::RunLock::read_active() {
-        println!("A backup is running now: {}", p.message);
+        println!("Active operation: {}", p.message);
     }
     println!("Recent runs:");
     for h in engine::load_history().iter().take(5) {
@@ -187,35 +233,74 @@ fn status() {
     }
 }
 
-fn backup(cfg: Config, trigger: &str, verbose: bool) -> i32 {
-    if !cfg.s3.is_complete() {
-        eprintln!("S3 is not configured yet. Open the app (or use --set) first.");
-        engine::log_line("backup skipped: S3 settings incomplete");
-        return 1;
-    }
-    let storage = match crate::remote::S3Storage::new(&cfg) {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            eprintln!("{}", e);
-            engine::log_line(&format!("backup could not start: {}", e));
-            return 1;
-        }
+fn preview(cfg: &Config, full: bool) -> i32 {
+    let cfg = match crate::managed::effective_for_cli(cfg) {
+        Ok(cfg) => cfg,
+        Err(error) => { eprintln!("{error}"); return 1; }
     };
+    let p = engine::preview_backup(&cfg, &Shared::new(), full);
+    if matches!(p.phase, Phase::Finished | Phase::FinishedWithErrors) {
+        println!("{} (local estimate): {} of {} files to upload ({}), {} unchanged.",
+            p.trigger, p.files_to_upload, p.files_found, human_bytes(p.bytes_total), p.files_skipped);
+    }
+    if p.phase != Phase::Finished {
+        eprintln!("{}", p.message);
+    }
+    for e in p.errors.iter().take(20) {
+        eprintln!("  ! {}", e);
+    }
+    i32::from(p.phase != Phase::Finished)
+}
+
+fn verify(cfg: &Config) -> i32 {
+    let cfg = match crate::managed::effective_for_cli(cfg) {
+        Ok(cfg) => cfg,
+        Err(error) => { eprintln!("{error}"); return 1; }
+    };
+    match crate::verify::run(&cfg, &Shared::new()) {
+        Ok(summary) => {
+            let mut issues = !summary.errors.is_empty();
+            for error in summary.errors {
+                eprintln!("{error}");
+            }
+            for (folder, report) in summary.reports {
+                println!(
+                    "{}: {} matched, {} missing, {} changed in S3, {} pending, {} missing tags, {} scan problems",
+                    folder, report.matched, report.missing, report.mismatched, report.pending,
+                    report.no_etag, report.scan_errors,
+                );
+                issues |= report.has_issues();
+                for detail in report.details {
+                    println!("  {detail}");
+                }
+            }
+            i32::from(issues)
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
+fn backup(cfg: Config, trigger: &str, verbose: bool, full: bool) -> i32 {
     let shared = Shared::new();
     let start = Instant::now();
     let s2 = shared.clone();
+    let (done, wait_for_done) = mpsc::channel::<()>();
     let reporter = verbose.then(|| {
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(1000));
-            let p = s2.snapshot();
-            if !p.phase.is_running() {
-                break;
+        std::thread::spawn(move || {
+            while wait_for_done.recv_timeout(Duration::from_secs(1)) == Err(mpsc::RecvTimeoutError::Timeout) {
+                let p = s2.snapshot();
+                if p.phase.is_running() {
+                    eprintln!("  {} — {}/{} files, {} / {}", p.message, p.files_uploaded, p.files_to_upload,
+                        human_bytes(p.bytes_done), human_bytes(p.bytes_total));
+                }
             }
-            eprintln!("  {} — {}/{} files, {} / {}", p.message, p.files_uploaded, p.files_to_upload,
-                human_bytes(p.bytes_done), human_bytes(p.bytes_total));
         })
     });
-    let p = engine::run_backup(&cfg, storage, shared, trigger);
+    let p = crate::managed::backup(&cfg, shared, trigger, full);
+    drop(done);
     if let Some(r) = reporter {
         let _ = r.join();
     }

@@ -12,6 +12,13 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
+#[path = "multipart.rs"]
+mod multipart;
+pub use multipart::UploadBudget;
+
+mod versions;
+pub use versions::{ObjectVersion, ObjectVersionsPage, VersionCursor};
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct S3Config {
     /// Custom endpoint URL (e.g. `http://127.0.0.1:9000`); empty = Amazon S3.
@@ -39,6 +46,16 @@ pub struct ObjectInfo {
 pub struct UploadOptions {
     pub part_size: u64,
     pub multipart_threshold: u64,
+    /// Maximum active part requests per file. Defaults to one.
+    pub multipart_parallelism: usize,
+    /// Optional private checkpoint file for restartable multipart uploads.
+    /// Callers must serialize transfers that share this file.
+    pub multipart_checkpoint: Option<PathBuf>,
+    /// Keep the completing checkpoint after success so the caller can remove
+    /// it once its own upload state is durable. Defaults to false.
+    pub retain_completed_checkpoint: bool,
+    /// Optional request limit shared by multiple concurrent file uploads.
+    pub upload_budget: Option<Arc<UploadBudget>>,
     pub content_type: Option<String>,
     pub metadata: Vec<(String, String)>,
     pub storage_class: Option<String>,
@@ -51,6 +68,10 @@ impl Default for UploadOptions {
         UploadOptions {
             part_size: 16 * 1024 * 1024,
             multipart_threshold: 32 * 1024 * 1024,
+            multipart_parallelism: 1,
+            multipart_checkpoint: None,
+            retain_completed_checkpoint: false,
+            upload_budget: None,
             content_type: None,
             metadata: Vec::new(),
             storage_class: None,
@@ -61,6 +82,10 @@ impl Default for UploadOptions {
 }
 
 impl UploadOptions {
+    pub fn uses_multipart(&self, size: u64) -> bool {
+        size >= self.multipart_threshold.max(5 * 1024 * 1024)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let algorithm = self.server_encryption.as_deref().unwrap_or("");
         if !matches!(algorithm, "" | "AES256" | "aws:kms") {
@@ -145,12 +170,13 @@ struct Call<'a> {
     query: Vec<(String, String)>,
     headers: Vec<(String, String)>,
     body: Option<&'a dyn Body>,
+    payload_hash: Option<String>,
     cancel: Option<&'a AtomicBool>,
 }
 
 impl<'a> Call<'a> {
     fn new(method: &'a str, target: Target<'a>) -> Self {
-        Call { method, target, query: Vec::new(), headers: Vec::new(), body: None, cancel: None }
+        Call { method, target, query: Vec::new(), headers: Vec::new(), body: None, payload_hash: None, cancel: None }
     }
     fn q(mut self, k: &str, v: &str) -> Self {
         self.query.push((k.into(), v.into()));
@@ -164,12 +190,25 @@ impl<'a> Call<'a> {
 
 const MAX_ATTEMPTS: u32 = 6;
 
+#[derive(Clone)]
+pub struct RequestCredentials {
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: String,
+}
+
+/// Supplies fresh credentials before an S3 request is signed.
+pub trait CredentialProvider: Send + Sync {
+    fn credentials(&self, rejected_access_key: Option<&str>) -> Result<RequestCredentials, S3Error>;
+}
+
 pub struct S3Client {
     cfg: S3Config,
     endpoint: Option<Url>,
     region: RwLock<String>,
     clock_skew: AtomicI64,
     http: HttpClient,
+    credential_provider: Option<Arc<dyn CredentialProvider>>,
 }
 
 fn strip_quotes(s: &str) -> String {
@@ -186,7 +225,16 @@ impl S3Client {
             Url::parse(&e).ok()
         };
         let region = if cfg.region.trim().is_empty() { "us-east-1".to_string() } else { cfg.region.trim().to_string() };
-        S3Client { cfg, endpoint, region: RwLock::new(region), clock_skew: AtomicI64::new(0), http: HttpClient::new(tls) }
+        S3Client { cfg, endpoint, region: RwLock::new(region), clock_skew: AtomicI64::new(0), http: HttpClient::new(tls), credential_provider: None }
+    }
+
+    pub fn with_credentials(mut self, provider: Arc<dyn CredentialProvider>) -> Self {
+        self.credential_provider = Some(provider);
+        self
+    }
+
+    pub(super) fn uses_session_provider(&self) -> bool {
+        self.credential_provider.is_some()
     }
 
     /// Validate the endpoint URL of a config; Err(message) if malformed.
@@ -267,15 +315,13 @@ impl S3Client {
     /// Perform a signed request with retries, region redirect and clock-skew handling.
     fn call(&self, c: &Call, mut sink: Option<&mut dyn Sink>, progress: &mut dyn FnMut(u64)) -> Result<Response, S3Error> {
         let is_cancelled = || c.cancel.map(|x| x.load(Ordering::Relaxed)).unwrap_or(false);
-        let payload_hash = match c.body {
-            None => EMPTY_SHA256.to_string(),
-            Some(b) => hash_body(b).map_err(|e| S3Error::local(&e))?,
+        let payload_hash = match (&c.payload_hash, c.body) {
+            (Some(hash), _) => hash.clone(),
+            (None, None) => EMPTY_SHA256.to_string(),
+            (None, Some(b)) => hash_body(b).map_err(|e| S3Error::local(&e))?,
         };
-        let creds = Credentials {
-            access_key: self.cfg.access_key.trim(),
-            secret_key: self.cfg.secret_key.trim(),
-            session_token: self.cfg.session_token.as_deref(),
-        };
+        let mut rejected = None;
+        let mut expiry_retried = false;
         let mut high = 0u64;
         let mut attempt = 0u32;
         let mut region_retries = 0;
@@ -290,6 +336,21 @@ impl S3Client {
             let mut headers = c.headers.clone();
             headers.push(("host".into(), url.host_header()));
             headers.push(("x-amz-content-sha256".into(), payload_hash.clone()));
+            let temporary = self.credential_provider.as_ref()
+                .map(|provider| provider.credentials(rejected.take().as_deref())).transpose()?;
+            let creds = match &temporary {
+                Some(session) => Credentials {
+                    access_key: &session.access_key, secret_key: &session.secret_key,
+                    session_token: Some(&session.session_token),
+                },
+                None => Credentials {
+                    access_key: self.cfg.access_key.trim(), secret_key: self.cfg.secret_key.trim(),
+                    session_token: self.cfg.session_token.as_deref(),
+                },
+            };
+            if is_cancelled() {
+                return Err(S3Error::cancelled());
+            }
             let now = time::now_unix() + self.clock_skew.load(Ordering::Relaxed);
             sigv4::sign(c.method, &curi, &c.query, &mut headers, &payload_hash, &creds, &region, "s3", &time::amz_date(now));
             if let Some(s) = sink.as_mut() {
@@ -315,7 +376,7 @@ impl S3Client {
                         return Err(S3Error::cancelled());
                     }
                     let local = e.kind() == io::ErrorKind::UnexpectedEof && e.to_string().contains("file");
-                    if local {
+                    if local || e.get_ref().is_some_and(|cause| cause.is::<multipart::PartReadError>()) {
                         return Err(S3Error::local(&e));
                     }
                     if attempt < MAX_ATTEMPTS && e.kind() != io::ErrorKind::Unsupported {
@@ -342,6 +403,13 @@ impl S3Client {
                 return Ok(resp);
             }
             let (err, region_hint, server_time) = parse_error(&resp, c.method == "HEAD");
+            if !expiry_retried && matches!(err.code.as_str(), "ExpiredToken" | "ExpiredTokenException") {
+                if let Some(session) = temporary {
+                    expiry_retried = true;
+                    rejected = Some(session.access_key);
+                    continue;
+                }
+            }
             if let Some(r) = region_hint {
                 if r != region && region_retries < 2 {
                     region_retries += 1;
@@ -470,72 +538,24 @@ impl S3Client {
         opts.validate().map_err(|e| S3Error::new(0, "InvalidEncryption", e))?;
         let size = fs::metadata(path).map_err(|e| S3Error::local(&e))?.len();
         let ct = opts.content_type.as_deref();
-        if size < opts.multipart_threshold.max(5 * 1024 * 1024) {
+        if !opts.uses_multipart(size) {
+            self.clear_multipart_checkpoint(key, opts, cancel)?;
             let body = FileRange { path: path.to_path_buf(), offset: 0, len: size };
             let mut c = Call::new("PUT", Target::Object(key));
             Self::object_headers(&mut c, ct, Some(opts));
             c.body = Some(&body);
             c.cancel = Some(cancel);
-            let r = self.call(&c, None, progress)?;
+            let mut remaining = size;
+            let r = self.upload_call(&c, opts, &mut |bytes| {
+                let delta = remaining.min(bytes);
+                remaining -= delta;
+                if delta > 0 {
+                    progress(delta);
+                }
+            })?;
             return Ok(strip_quotes(r.header("etag").unwrap_or("")));
         }
-
-        // Multipart: at most 10,000 parts of >= 5 MiB.
-        const MIB: u64 = 1024 * 1024;
-        let mut part = opts.part_size.max(5 * MIB);
-        let min_for_count = size.div_ceil(10_000);
-        if part < min_for_count {
-            part = min_for_count.div_ceil(MIB) * MIB;
-        }
-        let mut c = Call::new("POST", Target::Object(key)).q("uploads", "");
-        Self::object_headers(&mut c, ct, Some(opts));
-        c.cancel = Some(cancel);
-        let r = self.call_simple(&c)?;
-        let doc = xml::parse(&r.body_text()).map_err(|e| S3Error::new(r.status, "BadResponse", e))?;
-        let upload_id = doc
-            .child_text("UploadId")
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| S3Error::new(r.status, "BadResponse", "no UploadId in CreateMultipartUpload response"))?
-            .to_string();
-
-        let result = (|| -> Result<String, S3Error> {
-            let mut etags = Vec::new();
-            let mut offset = 0u64;
-            let mut n = 1u32;
-            while offset < size {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(S3Error::cancelled());
-                }
-                let len = part.min(size - offset);
-                let body = FileRange { path: path.to_path_buf(), offset, len };
-                let ns = n.to_string();
-                let mut c = Call::new("PUT", Target::Object(key)).q("partNumber", &ns).q("uploadId", &upload_id);
-                c.body = Some(&body);
-                c.cancel = Some(cancel);
-                let r = self.call(&c, None, progress)?;
-                let etag = r
-                    .header("etag")
-                    .ok_or_else(|| S3Error::new(r.status, "BadResponse", "UploadPart response without ETag"))?;
-                etags.push((n, etag.to_string()));
-                offset += len;
-                n += 1;
-            }
-            let mut body = String::from("<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
-            for (n, e) in &etags {
-                body.push_str(&format!("<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>", n, xml::escape(e)));
-            }
-            body.push_str("</CompleteMultipartUpload>");
-            let bb = BytesBody(body.as_bytes());
-            let mut c = Call::new("POST", Target::Object(key)).q("uploadId", &upload_id).h("content-type", "application/xml");
-            c.body = Some(&bb);
-            let r = self.call_simple(&c)?;
-            let doc = xml::parse(&r.body_text()).map_err(|e| S3Error::new(r.status, "BadResponse", e))?;
-            Ok(strip_quotes(doc.child_text("ETag").unwrap_or("")))
-        })();
-        if result.is_err() {
-            let _ = self.abort_multipart(key, &upload_id);
-        }
-        result
+        self.upload_multipart(key, path, size, opts, progress, cancel)
     }
 
     pub fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<(), S3Error> {
@@ -580,6 +600,26 @@ impl S3Client {
         max_keys: u32,
         token: Option<&str>,
     ) -> Result<(Vec<ObjectInfo>, Option<String>), S3Error> {
+        self.list_objects_page_inner(prefix, max_keys, token, None)
+    }
+
+    pub fn list_objects_page_cancel(
+        &self,
+        prefix: &str,
+        max_keys: u32,
+        token: Option<&str>,
+        cancel: &AtomicBool,
+    ) -> Result<(Vec<ObjectInfo>, Option<String>), S3Error> {
+        self.list_objects_page_inner(prefix, max_keys, token, Some(cancel))
+    }
+
+    fn list_objects_page_inner(
+        &self,
+        prefix: &str,
+        max_keys: u32,
+        token: Option<&str>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(Vec<ObjectInfo>, Option<String>), S3Error> {
         let mk = max_keys.to_string();
         let mut c = Call::new("GET", Target::Bucket).q("list-type", "2").q("max-keys", &mk);
         if !prefix.is_empty() {
@@ -588,19 +628,34 @@ impl S3Client {
         if let Some(t) = token {
             c = c.q("continuation-token", t);
         }
+        c.cancel = cancel;
         let r = self.call_simple(&c)?;
         let doc = xml::parse(&r.body_text()).map_err(|e| S3Error::new(r.status, "BadResponse", e))?;
+        if doc.name != "ListBucketResult" {
+            return Err(S3Error::new(r.status, "BadResponse", "Expected an S3 object listing"));
+        }
         let items = doc
             .children_named("Contents")
-            .map(|e| ObjectInfo {
-                key: e.child_text("Key").unwrap_or("").to_string(),
-                size: e.child_text("Size").and_then(|s| s.trim().parse().ok()).unwrap_or(0),
-                etag: strip_quotes(e.child_text("ETag").unwrap_or("")),
-                last_modified: e.child_text("LastModified").unwrap_or("").to_string(),
+            .map(|e| {
+                let key = e.child_text("Key").filter(|key| !key.is_empty())
+                    .ok_or_else(|| S3Error::new(r.status, "BadResponse", "Object listing entry without a key"))?;
+                Ok(ObjectInfo {
+                    key: key.to_string(),
+                    size: e.child_text("Size").and_then(|s| s.trim().parse().ok()).unwrap_or(0),
+                    etag: strip_quotes(e.child_text("ETag").unwrap_or("")),
+                    last_modified: e.child_text("LastModified").unwrap_or("").to_string(),
+                })
             })
-            .collect();
-        let truncated = doc.child_text("IsTruncated").map(|s| s.trim() == "true").unwrap_or(false);
+            .collect::<Result<_, S3Error>>()?;
+        let truncated = match doc.child_text("IsTruncated").map(str::trim) {
+            Some("true" | "1") => true,
+            Some("false" | "0") => false,
+            _ => return Err(S3Error::new(r.status, "BadResponse", "Object listing without a valid IsTruncated value")),
+        };
         let next = doc.child_text("NextContinuationToken").filter(|s| !s.is_empty()).map(String::from);
+        if truncated && next.is_none() {
+            return Err(S3Error::new(r.status, "BadResponse", "Truncated object listing without a continuation token"));
+        }
         Ok((items, if truncated { next } else { None }))
     }
 
@@ -626,6 +681,17 @@ impl S3Client {
         progress: &mut dyn FnMut(u64),
         cancel: &AtomicBool,
     ) -> Result<(), S3Error> {
+        self.download_to_file(key, None, dest, progress, cancel).map(|_| ())
+    }
+
+    fn download_to_file(
+        &self,
+        key: &str,
+        version: Option<&ObjectVersion>,
+        dest: &Path,
+        progress: &mut dyn FnMut(u64),
+        cancel: &AtomicBool,
+    ) -> Result<Response, S3Error> {
         if let Some(parent) = dest.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| S3Error::local(&e))?;
@@ -636,15 +702,25 @@ impl S3Client {
         let tmp = PathBuf::from(tmp);
         let mut f = File::create(&tmp).map_err(|e| S3Error::local(&e))?;
         let mut c = Call::new("GET", Target::Object(key));
+        if let Some(version) = version {
+            c = c.q("versionId", &version.version_id);
+        }
         c.cancel = Some(cancel);
-        let res = self.call(&c, Some(&mut f), progress).and_then(|_| f.sync_all().map_err(|e| S3Error::local(&e)));
+        let res = self.call(&c, Some(&mut f), progress).and_then(|response| {
+            if let Some(version) = version {
+                versions::confirm_download(version, &response, &f)?;
+            }
+            f.sync_all().map_err(|e| S3Error::local(&e))?;
+            Ok(response)
+        });
         drop(f);
         match res {
-            Ok(()) => {
+            Ok(response) => {
                 if dest.exists() {
                     let _ = fs::remove_file(dest);
                 }
-                fs::rename(&tmp, dest).map_err(|e| S3Error::local(&e))
+                fs::rename(&tmp, dest).map_err(|e| S3Error::local(&e))?;
+                Ok(response)
             }
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
@@ -720,6 +796,33 @@ mod tests {
             S3Config { endpoint: endpoint.into(), bucket: bucket.into(), path_style, ..Default::default() },
             Arc::new(NoTls),
         )
+    }
+
+    #[test]
+    fn object_listing_rejects_missing_pagination_state_or_key() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let replies = [
+            "<ListBucketResult/>",
+            "<ListBucketResult><IsTruncated>unknown</IsTruncated></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Contents/></ListBucketResult>",
+        ];
+        let server = std::thread::spawn(move || {
+            for body in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    stream.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                write!(stream, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let client = client(&endpoint, "bucket", true);
+        let invalid = replies.map(|_| client.list_objects_page("", 1000, None).is_err());
+        server.join().unwrap();
+        assert_eq!(invalid, [true, true, true]);
     }
 
     #[test]

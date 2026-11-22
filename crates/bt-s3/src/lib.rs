@@ -11,5 +11,8 @@ pub mod time;
 pub mod xml;
 
 pub use client::{BodySource, BytesBody, FileRange, ObjectInfo, S3Client, S3Config, UploadOptions};
+pub use client::UploadBudget;
+pub use client::{ObjectVersion, ObjectVersionsPage, VersionCursor};
+pub use client::{CredentialProvider, RequestCredentials};
 pub use error::S3Error;
 pub use http::{NoTls, Stream, TlsConnector, Url};

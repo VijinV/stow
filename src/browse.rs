@@ -1,12 +1,12 @@
 //! Bucket inventory and safe, non-overwriting restores.
 use crate::config::S3Settings;
-use bt_s3::ObjectInfo;
+use bt_s3::{ObjectInfo, ObjectVersion, ObjectVersionsPage, S3Error, VersionCursor};
 use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
 };
@@ -20,11 +20,52 @@ pub struct BrowserEntry {
     pub last_modified: String,
 }
 
-/// Inventory covers the entire bucket, including keys outside the upload prefix.
+/// Standalone inventory covers the bucket. Managed inventory starts at the device prefix.
 pub fn inventory(settings: &S3Settings) -> Result<Vec<ObjectInfo>, String> {
     crate::remote::client(settings)?
-        .list_objects("")
+        .list_objects(if settings.managed.is_some() { &settings.prefix } else { "" })
         .map_err(|e| e.to_string())
+}
+
+pub fn version_page(
+    settings: &S3Settings,
+    prefix: &str,
+    exact: bool,
+    cursor: Option<&VersionCursor>,
+    cancel: &AtomicBool,
+) -> Result<ObjectVersionsPage, String> {
+    if settings.managed.is_some() && !prefix.starts_with(&settings.prefix) {
+        return Err("Choose an object or folder within this device’s managed storage.".into());
+    }
+    let mut page = crate::remote::client(settings)?
+        .list_object_versions_page(prefix, 100, cursor, cancel)
+        .map_err(|e| version_error("Could not list file versions", "s3:ListBucketVersions", e))?;
+    if exact {
+        // Exact matches are contiguous in S3's key order. A cursor on the
+        // requested key can still lead to older versions or delete markers.
+        if page.versions.iter().any(|v| v.object.key.as_str() > prefix)
+            || page.next.as_ref().is_some_and(|next| next.key() > prefix)
+        {
+            page.next = None;
+        }
+        page.versions.retain(|v| v.object.key == prefix);
+    }
+    Ok(page)
+}
+
+fn version_error(action: &str, permission: &str, error: S3Error) -> String {
+    if matches!(error.code.as_str(), "AccessDenied" | "Forbidden") {
+        format!("{action}. Check the {permission} permission. {error}")
+    } else if matches!(error.status, 405 | 501)
+        || matches!(
+            error.code.as_str(),
+            "NotImplemented" | "NotSupported" | "UnsupportedOperation"
+        )
+    {
+        format!("{action}. The storage provider rejected the version operation. {error}")
+    } else {
+        format!("{action}. {error}")
+    }
 }
 
 fn folder_prefix(prefix: &str) -> String {
@@ -106,38 +147,80 @@ fn safe_relative(s: &str) -> Result<PathBuf, String> {
     Ok(PathBuf::from(s))
 }
 
-struct Staging(PathBuf);
-impl Staging {
-    fn new(parent: &Path) -> Result<Self, String> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        for _ in 0..100 {
-            let time = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            let p = parent.join(format!(
-                ".backup-restore-{}-{time}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            let mut b = fs::DirBuilder::new();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::DirBuilderExt;
-                b.mode(0o700);
-            }
-            match b.create(&p) {
-                Ok(()) => return Ok(Self(p)),
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(e.to_string()),
-            }
+fn create_staging_dir(parent: &Path) -> Result<PathBuf, String> {
+    for _ in 0..100 {
+        let path = parent.join(format!(
+            ".backup-restore-{}",
+            crate::file_crypto::generate_key()?
+        ));
+        #[cfg(unix)]
+        let created = {
+            use std::os::unix::fs::DirBuilderExt;
+            fs::DirBuilder::new().mode(0o700).create(&path)
+        };
+        #[cfg(not(unix))]
+        let created = fs::create_dir(&path);
+        match created {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.to_string()),
         }
-        Err("Cannot allocate a private restore directory".into())
     }
+    Err("Cannot allocate a private restore directory".into())
 }
-impl Drop for Staging {
+
+#[cfg(any(test, not(target_os = "linux")))]
+struct TempDir(PathBuf);
+
+#[cfg(any(test, not(target_os = "linux")))]
+impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+use linux_restore::Staging;
+
+#[cfg(not(target_os = "linux"))]
+struct Staging {
+    dest: PathBuf,
+    dir: TempDir,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Staging {
+    fn new(dest: &Path) -> Result<Self, String> {
+        let meta = fs::symlink_metadata(dest).map_err(|e| format!("Restore destination: {e}"))?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err("Restore destination must be a real directory".into());
+        }
+        let dest = fs::canonicalize(dest).map_err(|e| e.to_string())?;
+        let dir = TempDir(create_staging_dir(&dest)?);
+        Ok(Self { dest, dir })
+    }
+
+    fn path(&self) -> &Path {
+        &self.dir.0
+    }
+
+    fn publish(&self, source: &Path, relative: &Path) -> Result<(), String> {
+        let mut parent = self.dest.clone();
+        let parts: Vec<_> = relative.components().collect();
+        for part in &parts[..parts.len() - 1] {
+            parent.push(part);
+            match fs::create_dir(&parent) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(e) => return Err(e.to_string()),
+            }
+            let m = fs::symlink_metadata(&parent).map_err(|e| e.to_string())?;
+            if !m.is_dir() || m.file_type().is_symlink() {
+                return Err("Unsafe restore directory".into());
+            }
+        }
+        fs::hard_link(source, self.dest.join(relative))
+            .map_err(|e| format!("Cannot restore without overwriting an existing file: {e}"))
     }
 }
 
@@ -160,27 +243,62 @@ pub fn restore(
         |key, path, cb| {
             let client = crate::remote::client(settings)?;
             let metadata = client.object_metadata(key).map_err(|e| e.to_string())?;
-            let marker = metadata
-                .iter()
-                .find(|(name, _)| name == "bt-encrypted")
-                .map(|(_, value)| value.as_str());
             client
                 .get_object_to_file(key, path, cb, &cancel)
                 .map_err(|e| e.to_string())?;
-            if let Some(marker) = marker {
-                if marker != "BTENC001" {
-                    return Err(format!("Unsupported encrypted object format: {marker}"));
-                }
-            }
-            if marker.is_some() && !crate::file_crypto::is_encrypted_file(path)? {
-                return Err(
-                    "Object is marked encrypted but its encryption envelope is missing or corrupt"
-                        .into(),
-                );
-            }
-            Ok(())
+            check_encryption_marker(&metadata, path)
         },
     )
+}
+
+pub fn restore_version(
+    settings: &S3Settings,
+    version: ObjectVersion,
+    dest: &Path,
+    progress: Arc<Mutex<RestoreProgress>>,
+    cancel: Arc<AtomicBool>,
+) -> Result<String, String> {
+    let prefix = version
+        .object
+        .key
+        .rsplit_once('/')
+        .map_or("", |(prefix, _)| prefix);
+    restore_with(
+        vec![version.object.clone()],
+        prefix,
+        dest,
+        &progress,
+        &cancel,
+        &settings.recovery_key,
+        |_, path, cb| {
+            let client = crate::remote::client(settings)?;
+            let metadata = client
+                .get_object_version_to_file(&version, path, cb, &cancel)
+                .map_err(|e| {
+                    version_error(
+                        "Could not download the file version",
+                        "s3:GetObjectVersion",
+                        e,
+                    )
+                })?;
+            check_encryption_marker(&metadata, path)
+        },
+    )
+}
+
+fn check_encryption_marker(metadata: &[(String, String)], path: &Path) -> Result<(), String> {
+    if let Some((_, marker)) = metadata.iter().find(|(name, _)| name == "bt-encrypted") {
+        if marker != "BTENC001" {
+            return Err(format!("Unsupported encrypted object format: {marker}"));
+        }
+        if !crate::file_crypto::is_encrypted_file(path)? {
+            return Err(
+                "Object is marked encrypted but its encryption envelope is missing or corrupt"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn restore_with<F>(
@@ -215,19 +333,14 @@ where
                 .ok_or_else(|| format!("Object {} is outside the selected folder", o.key))?;
             selected.push((safe_relative(relative)?, o));
         }
-        let meta = fs::symlink_metadata(dest).map_err(|e| format!("Restore destination: {e}"))?;
-        if !meta.is_dir() || meta.file_type().is_symlink() {
-            return Err("Restore destination must be a real directory".into());
-        }
-        let dest = fs::canonicalize(dest).map_err(|e| e.to_string())?;
-        let staging = Staging::new(&dest)?;
+        let staging = Staging::new(dest)?;
         for (relative, o) in selected {
             if cancel.load(Ordering::Relaxed) {
                 return Err("Restore cancelled".into());
             }
             progress.lock().unwrap().current = o.key.clone();
-            let source = staging.0.join("download");
-            let output = staging.0.join("plain");
+            let source = staging.path().join("download");
+            let output = staging.path().join("plain");
             let before = progress.lock().unwrap().bytes_done;
             let mut received = 0u64;
             download(&o.key, &source, &mut |n| {
@@ -244,17 +357,18 @@ where
             if cancel.load(Ordering::Relaxed) {
                 return Err("Restore cancelled".into());
             }
-            publish(&output, &dest, &relative).map_err(|e| format!("{}: {e}", o.key))?;
+            staging
+                .publish(&output, &relative)
+                .map_err(|e| format!("{}: {e}", o.key))?;
             fs::remove_file(&source).map_err(|e| e.to_string())?;
             fs::remove_file(&output).map_err(|e| e.to_string())?;
             let mut p = progress.lock().unwrap();
             p.files_done += 1;
             p.bytes_done = before.saturating_add(o.size);
         }
-        Ok(format!(
-            "Restored {} files",
-            progress.lock().unwrap().files_done
-        ))
+        let count = progress.lock().unwrap().files_done;
+        let noun = if count == 1 { "file" } else { "files" };
+        Ok(format!("Restored {count} {noun}"))
     })();
     let mut p = progress.lock().unwrap();
     p.finished = true;
@@ -267,20 +381,43 @@ where
     result.map_err(|_| p.error.clone().unwrap())
 }
 
-// Linux uses directory descriptors and O_NOFOLLOW throughout: a concurrent rename
-// or symlink replacement cannot redirect writes outside the selected directory.
 #[cfg(target_os = "linux")]
-fn publish(source: &Path, dest: &Path, relative: &Path) -> Result<(), String> {
+mod linux_restore {
+    use super::create_staging_dir;
     use std::{
         ffi::CString,
+        fs::{self, DirBuilder, File, OpenOptions},
+        io,
         os::{
-            fd::{AsRawFd, FromRawFd},
-            unix::ffi::OsStrExt,
+            fd::AsRawFd,
+            unix::{
+                ffi::OsStrExt,
+                fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+            },
         },
+        path::{Path, PathBuf},
     };
+
+    #[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+    const O_PATH: i32 = 0x1000000;
+    #[cfg(not(any(target_arch = "sparc", target_arch = "sparc64")))]
+    const O_PATH: i32 = 0o10000000;
+    const O_NOFOLLOW: i32 = if cfg!(any(
+        target_arch = "aarch64",
+        target_arch = "arm",
+        target_arch = "m68k",
+        target_arch = "powerpc",
+        target_arch = "powerpc64"
+    )) {
+        0o100000
+    } else {
+        0o400000
+    };
+    const AT_FDCWD: i32 = -100;
+    const AT_SYMLINK_FOLLOW: i32 = 0x400;
+
     unsafe extern "C" {
-        fn openat(fd: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
-        fn mkdirat(fd: i32, path: *const std::ffi::c_char, mode: u32) -> i32;
+        fn geteuid() -> u32;
         fn linkat(
             fd: i32,
             source: *const std::ffi::c_char,
@@ -289,64 +426,132 @@ fn publish(source: &Path, dest: &Path, relative: &Path) -> Result<(), String> {
             flags: i32,
         ) -> i32;
     }
-    let err = || std::io::Error::last_os_error().to_string();
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut dir = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(0o200000 | 0o400000)
-        .open(dest)
-        .map_err(|e| e.to_string())?;
-    let parts: Vec<_> = relative.components().collect();
-    for part in &parts[..parts.len() - 1] {
-        let name = CString::new(part.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-        unsafe {
-            mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o700);
-        }
-        let fd = unsafe {
-            openat(
-                dir.as_raw_fd(),
-                name.as_ptr(),
-                0o200000 | 0o400000 | 0o2000000,
-            )
-        };
-        if fd < 0 {
-            return Err(format!(
-                "Unsafe or inaccessible restore directory: {}",
-                err()
+
+    fn open_path(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(O_PATH | O_NOFOLLOW)
+            .open(path)
+    }
+
+    fn open_dir(path: &Path) -> io::Result<File> {
+        let dir = open_path(path)?;
+        if !dir.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Expected a real directory",
             ));
         }
-        dir = unsafe { fs::File::from_raw_fd(fd) };
+        Ok(dir)
     }
-    let src = CString::new(source.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-    let name =
-        CString::new(parts.last().unwrap().as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-    if unsafe { linkat(-100, src.as_ptr(), dir.as_raw_fd(), name.as_ptr(), 0) } != 0 {
-        return Err(format!(
-            "Cannot restore without overwriting an existing file: {}",
-            err()
-        ));
-    }
-    Ok(())
-}
 
-#[cfg(not(target_os = "linux"))]
-fn publish(source: &Path, dest: &Path, relative: &Path) -> Result<(), String> {
-    let mut parent = dest.to_path_buf();
-    let parts: Vec<_> = relative.components().collect();
-    for part in &parts[..parts.len() - 1] {
-        parent.push(part);
-        match fs::create_dir(&parent) {
-            Ok(()) => (),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
-            Err(e) => return Err(e.to_string()),
+    fn fd_path(file: &File) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+
+    pub(super) struct Staging {
+        dest: File,
+        dir: File,
+        entry: PathBuf,
+        path: PathBuf,
+    }
+
+    impl Staging {
+        pub(super) fn new(dest: &Path) -> Result<Self, String> {
+            // Strip trailing separators and "." so the last directory entry
+            // is the one opened without following symlinks.
+            let dest_path: PathBuf = dest.components().collect();
+            let dest = open_dir(&dest_path).map_err(|e| format!("Restore destination: {e}"))?;
+            let entry = create_staging_dir(&fd_path(&dest))?;
+            let dir = open_dir(&entry).map_err(|e| format!("Restore staging directory: {e}"))?;
+            let metadata = dir.metadata().map_err(|e| e.to_string())?;
+            let path = fd_path(&dir);
+
+            // mkdir and open are separate. Only trust a private, empty
+            // directory owned by this user before the path-based helpers run.
+            if metadata.uid() != unsafe { geteuid() }
+                || metadata.mode() & 0o777 != 0o700
+                || fs::read_dir(&path)
+                    .map_err(|e| e.to_string())?
+                    .next()
+                    .is_some()
+            {
+                return Err("Restore staging directory is not private and empty".into());
+            }
+
+            Ok(Self {
+                dest,
+                dir,
+                entry,
+                path,
+            })
         }
-        let m = fs::symlink_metadata(&parent).map_err(|e| e.to_string())?;
-        if !m.is_dir() || m.file_type().is_symlink() {
-            return Err("Unsafe restore directory".into());
+
+        pub(super) fn path(&self) -> &Path {
+            &self.path
+        }
+
+        pub(super) fn publish(&self, source: &Path, relative: &Path) -> Result<(), String> {
+            let source = open_path(source).map_err(|e| e.to_string())?;
+            if !source.metadata().map_err(|e| e.to_string())?.is_file() {
+                return Err("Restore source must be a regular file".into());
+            }
+            let mut dir = self.dest.try_clone().map_err(|e| e.to_string())?;
+            let parts: Vec<_> = relative.components().collect();
+            for part in &parts[..parts.len() - 1] {
+                let child = fd_path(&dir).join(part);
+                match DirBuilder::new().mode(0o700).create(&child) {
+                    Ok(()) => (),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => (),
+                    Err(e) => return Err(e.to_string()),
+                }
+                dir = open_dir(&child)
+                    .map_err(|e| format!("Unsafe or inaccessible restore directory: {e}"))?;
+            }
+            let src =
+                CString::new(fd_path(&source).as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+            let name = CString::new(parts.last().unwrap().as_os_str().as_bytes())
+                .map_err(|e| e.to_string())?;
+            // Follow the proc descriptor link to the open inode. linkat
+            // atomically fails if the destination name is occupied.
+            if unsafe {
+                linkat(
+                    AT_FDCWD,
+                    src.as_ptr(),
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    AT_SYMLINK_FOLLOW,
+                )
+            } != 0
+            {
+                return Err(format!(
+                    "Cannot restore without overwriting an existing file: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            Ok(())
         }
     }
-    fs::hard_link(source, dest.join(relative))
-        .map_err(|e| format!("Cannot restore without overwriting an existing file: {e}"))
+
+    impl Drop for Staging {
+        fn drop(&mut self) {
+            // Remove files from the pinned directory even if it was moved.
+            if let Ok(staged) = fs::read_dir(&self.path) {
+                for entry in staged.flatten() {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+            // Linux removes a directory by name. Check identity and use
+            // non-recursive removal so a name race cannot remove a tree.
+            if let (Ok(current), Ok(opened)) =
+                (fs::symlink_metadata(&self.entry), self.dir.metadata())
+            {
+                if (current.dev(), current.ino()) == (opened.dev(), opened.ino()) {
+                    let _ = fs::remove_dir(&self.entry);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -385,8 +590,8 @@ mod tests {
         }
         assert!(safe_relative("Photos/été 1.jpg").is_ok());
     }
-    fn temp() -> Staging {
-        Staging::new(&std::env::temp_dir()).unwrap()
+    fn temp() -> TempDir {
+        TempDir(create_staging_dir(&std::env::temp_dir()).unwrap())
     }
     fn state() -> Arc<Mutex<RestoreProgress>> {
         Arc::new(Mutex::new(RestoreProgress::default()))
@@ -396,6 +601,191 @@ mod tests {
         progress(4);
         progress(10);
         Ok(())
+    }
+    #[test]
+    fn exact_version_history_keeps_markers_and_stops_at_sibling_keys() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (entry, next_key, next_id) in [
+                (
+                    "<DeleteMarker><Key>file</Key><VersionId>deleted</VersionId><IsLatest>true</IsLatest></DeleteMarker>",
+                    "file",
+                    "deleted",
+                ),
+                (
+                    "<Version><Key>file</Key><VersionId>old</VersionId><IsLatest>false</IsLatest><Size>14</Size></Version><DeleteMarker><Key>file-copy</Key><VersionId>sibling</VersionId><IsLatest>true</IsLatest></DeleteMarker>",
+                    "file-copy",
+                    "sibling",
+                ),
+                ("", "file-copy", "sibling"),
+            ] {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert!(line.starts_with("GET /bucket?"));
+                assert!(line.contains("prefix=file"));
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let body = format!(
+                    "<ListVersionsResult><IsTruncated>true</IsTruncated><NextKeyMarker>{next_key}</NextKeyMarker><NextVersionIdMarker>{next_id}</NextVersionIdMarker>{entry}</ListVersionsResult>"
+                );
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        let settings = S3Settings {
+            endpoint: format!("http://{address}"),
+            bucket: "bucket".into(),
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            path_style: true,
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let first = version_page(&settings, "file", true, None, &cancel).unwrap();
+        let last = version_page(&settings, "file", true, first.next.as_ref(), &cancel).unwrap();
+        let empty = version_page(&settings, "file", true, None, &cancel).unwrap();
+        server.join().unwrap();
+
+        assert_eq!(first.versions.len(), 1);
+        assert!(first.versions[0].is_delete_marker);
+        assert!(first.next.is_some());
+        assert_eq!(last.versions.len(), 1);
+        assert_eq!(last.versions[0].version_id, "old");
+        assert!(last.next.is_none());
+        assert!(empty.versions.is_empty());
+        assert!(empty.next.is_none());
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_keeps_using_staging_directory_after_rename() {
+        let dest = temp();
+        let renamed = dest.0.join("renamed-stage");
+        restore_with(
+            vec![obj("file", 14)],
+            "",
+            &dest.0,
+            &state(),
+            &AtomicBool::new(false),
+            "",
+            |key, path, cb| {
+                let entry = fs::read_dir(&dest.0).unwrap().next().unwrap().unwrap();
+                fs::rename(entry.path(), &renamed).unwrap();
+                bytes_download(key, path, cb)
+            },
+        )
+        .unwrap();
+        assert_eq!(fs::read(dest.0.join("file")).unwrap(), b"restored bytes");
+        assert_eq!(fs::read_dir(renamed).unwrap().count(), 0);
+    }
+    #[test]
+    fn restores_exact_encrypted_version_with_identity_and_no_overwrite_checks() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+
+        let fixtures = temp();
+        let recovery_key = crate::file_crypto::generate_key().unwrap();
+        let original = fixtures.0.join("original");
+        let cipher = fixtures.0.join("encrypted");
+        let historical = b"older version before deletion";
+        fs::write(&original, historical).unwrap();
+        crate::file_crypto::encrypt_file(&original, &cipher, &recovery_key).unwrap();
+        let bytes = fs::read(cipher).unwrap();
+        let size = bytes.len() as u64;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for version in ["old+/=%2F&", "old+/=%2F&", "current"] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(
+                    line.trim_end(),
+                    "GET /bucket/root/caf%C3%A9%20%2B.txt?versionId=old%2B%2F%3D%252F%26 HTTP/1.1"
+                );
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                }
+                let body = if version == "current" {
+                    b"other bytes"
+                } else {
+                    bytes.as_slice()
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\nx-amz-version-id: {version}\r\nx-amz-meta-bt-encrypted: BTENC001\r\n\r\n",
+                    body.len(),
+                )
+                .unwrap();
+                stream.write_all(body).unwrap();
+            }
+        });
+        let settings = S3Settings {
+            endpoint: format!("http://{address}"),
+            bucket: "bucket".into(),
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            path_style: true,
+            recovery_key,
+            ..Default::default()
+        };
+        let version = bt_s3::ObjectVersion {
+            object: obj("root/café +.txt", size),
+            version_id: "old+/=%2F&".into(),
+            is_latest: false,
+            is_delete_marker: false,
+        };
+        let d = temp();
+        let p = state();
+        restore_version(
+            &settings,
+            version.clone(),
+            &d.0,
+            p.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        assert_eq!(fs::read(d.0.join("café +.txt")).unwrap(), historical);
+        assert_eq!(p.lock().unwrap().files_done, 1);
+        fs::write(d.0.join("café +.txt"), b"keep local edits").unwrap();
+        let error = restore_version(
+            &settings,
+            version.clone(),
+            &d.0,
+            p.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap_err();
+        assert!(error.contains("existing file"));
+        let error = restore_version(
+            &settings,
+            version,
+            &d.0,
+            p.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap_err();
+        assert!(error.contains("did not confirm the requested version"));
+        assert_eq!(
+            fs::read(d.0.join("café +.txt")).unwrap(),
+            b"keep local edits"
+        );
+        assert_eq!(fs::read_dir(&d.0).unwrap().count(), 1);
+        assert_eq!(p.lock().unwrap().files_done, 0);
+        server.join().unwrap();
     }
     #[test]
     fn restores_original_bytes_and_reports_progress() {

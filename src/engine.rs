@@ -1,25 +1,30 @@
 //! Backup engine: scan folders, compare with the upload index, upload new/changed files in parallel.
-use crate::config::Config;
+use crate::config::{Config, Folder, DEV_ARTIFACT_DIRS};
 use crate::glob;
 use crate::json::Json;
 use crate::paths;
 use crate::timefmt::now_secs;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// Where backups go. Implemented for S3 (`remote::S3Storage`) and a local directory (tests).
 pub trait Storage: Send + Sync {
     /// Upload a file to `key`; returns an ETag / version tag. `progress` gets byte deltas.
     fn upload_file(&self, key: &str, path: &Path, progress: &mut dyn FnMut(u64), cancel: &AtomicBool) -> Result<String, String>;
+
+    /// Release any upload receipt after the corresponding index entry is durable.
+    fn index_committed(&self, _key: &str) {}
 }
 
-/// Copies files into a directory. Used by tests and for dry runs.
+/// Copies files into a directory for tests.
+#[cfg(test)]
 pub struct LocalDirStorage(pub PathBuf);
 
+#[cfg(test)]
 impl Storage for LocalDirStorage {
     fn upload_file(&self, key: &str, path: &Path, progress: &mut dyn FnMut(u64), cancel: &AtomicBool) -> Result<String, String> {
         let dest = self.0.join(key);
@@ -98,6 +103,7 @@ pub struct Progress {
     pub files_failed: u64,
     pub bytes_total: u64,
     pub bytes_done: u64,
+    pub bytes_skipped: u64,
     pub current: Vec<String>,
     pub errors: Vec<String>,
     pub message: String,
@@ -117,6 +123,7 @@ impl Default for Progress {
             files_failed: 0,
             bytes_total: 0,
             bytes_done: 0,
+            bytes_skipped: 0,
             current: Vec::new(),
             errors: Vec::new(),
             message: String::new(),
@@ -146,6 +153,7 @@ impl Progress {
         j.set("files_failed", self.files_failed);
         j.set("bytes_total", self.bytes_total);
         j.set("bytes_done", self.bytes_done);
+        j.set("bytes_skipped", self.bytes_skipped);
         j.set("message", self.message.as_str());
         j.set("current", Json::Arr(self.current.iter().map(|s| Json::from(s.as_str())).collect()));
         j.set("errors", Json::Arr(self.errors.iter().take(50).map(|s| Json::from(s.as_str())).collect()));
@@ -166,6 +174,7 @@ impl Progress {
             files_failed: n("files_failed"),
             bytes_total: n("bytes_total"),
             bytes_done: n("bytes_done"),
+            bytes_skipped: n("bytes_skipped"),
             current: j.arr("current").iter().filter_map(|x| x.as_str().map(String::from)).collect(),
             errors: j.arr("errors").iter().filter_map(|x| x.as_str().map(String::from)).collect(),
             message: j.str_or("message", ""),
@@ -187,6 +196,7 @@ pub struct UploadIndex {
     pub path: PathBuf,
     pub entries: HashMap<String, IndexEntry>,
     policy: String,
+    pending_receipts: Vec<String>,
 }
 
 fn esc(s: &str) -> String {
@@ -214,35 +224,81 @@ fn unesc(s: &str) -> String {
 impl UploadIndex {
     /// One index per destination (endpoint + bucket), so switching buckets re-uploads.
     pub fn path_for(cfg: &Config) -> PathBuf {
+        if let Some(target) = &cfg.s3.managed {
+            return paths::app_dir().join(format!("index-managed-{}.tsv", target.scope()));
+        }
         let id = format!("{}|{}", cfg.s3.endpoint.trim(), cfg.s3.bucket.trim());
         let h = bt_tls::crypto::util::hex(&bt_tls::crypto::sha256::sha256(id.as_bytes()));
         paths::app_dir().join(format!("index-{}.tsv", &h[..16]))
     }
 
-    pub fn load(path: PathBuf) -> UploadIndex {
-        let mut entries = HashMap::new();
-        let mut policy = String::new();
-        if let Ok(s) = std::fs::read_to_string(&path) {
-            for line in s.lines() {
-                if let Some(value) = line.strip_prefix("# encryption-policy:") { policy = value.to_string(); continue; }
-                let f: Vec<&str> = line.split('\t').collect();
-                if f.len() == 4 {
-                    if let (Ok(size), Ok(mt)) = (f[1].parse(), f[2].parse()) {
-                        entries.insert(unesc(f[0]), IndexEntry { size, mtime_ns: mt, etag: unesc(f[3]) });
-                    }
-                }
-            }
-        }
-        UploadIndex { path, entries, policy }
+    pub fn for_preview(cfg: &Config) -> UploadIndex {
+        Self::load_for_path(Self::path_for(cfg), cfg).0
     }
 
-    fn load_for_path(path: PathBuf, cfg: &Config) -> UploadIndex {
+    pub fn load(path: PathBuf) -> UploadIndex {
+        Self::read(path.clone(), false).unwrap_or_else(|_| UploadIndex {
+            path,
+            entries: HashMap::new(),
+            policy: String::new(),
+            pending_receipts: Vec::new(),
+        })
+    }
+
+    pub fn load_checked(path: PathBuf) -> std::io::Result<UploadIndex> {
+        Self::read(path, true)
+    }
+
+    fn read(path: PathBuf, strict: bool) -> std::io::Result<UploadIndex> {
+        let mut entries = HashMap::new();
+        let mut policy = String::new();
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(e),
+        };
+        for (i, line) in contents.lines().enumerate() {
+            if let Some(value) = line.strip_prefix("# encryption-policy:") {
+                policy = value.to_string();
+                continue;
+            }
+            let fields: Vec<&str> = line.split('\t').collect();
+            if let [key, size, mtime, etag] = fields.as_slice() {
+                if let (Ok(size), Ok(mtime_ns)) = (size.parse(), mtime.parse()) {
+                    entries.insert(unesc(key), IndexEntry { size, mtime_ns, etag: unesc(etag) });
+                    continue;
+                }
+            }
+            if strict && !line.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Invalid upload index entry at line {}", i + 1),
+                ));
+            }
+        }
+        Ok(UploadIndex { path, entries, policy, pending_receipts: Vec::new() })
+    }
+
+    pub fn policy_id(cfg: &Config) -> String {
         let key = if cfg.s3.client_encryption { cfg.s3.recovery_key.trim().to_ascii_lowercase() } else { String::new() };
         let policy = format!("{}|{}|{}|{}", cfg.s3.client_encryption, key, cfg.s3.server_encryption.trim(), cfg.s3.kms_key_id.trim());
-        let policy = bt_tls::crypto::util::hex(&bt_tls::crypto::sha256::sha256(policy.as_bytes()));
+        let policy = if cfg.s3.managed.is_some() { format!("{policy}|{}", cfg.s3.storage_class) } else { policy };
+        bt_tls::crypto::util::hex(&bt_tls::crypto::sha256::sha256(policy.as_bytes()))
+    }
+
+    pub fn matches_policy(&self, cfg: &Config) -> bool {
+        self.policy == Self::policy_id(cfg)
+    }
+
+    fn load_for_path(path: PathBuf, cfg: &Config) -> (UploadIndex, bool) {
+        let policy = Self::policy_id(cfg);
         let mut index = Self::load(path);
-        if index.policy != policy { index.entries.clear(); index.policy = policy; }
-        index
+        let policy_changed = index.policy != policy;
+        if policy_changed {
+            index.entries.clear();
+            index.policy = policy;
+        }
+        (index, policy_changed)
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -254,10 +310,16 @@ impl UploadIndex {
             let e = &self.entries[k];
             s.push_str(&format!("{}\t{}\t{}\t{}\n", esc(k), e.size, e.mtime_ns, esc(&e.etag)));
         }
-        if let Some(p) = self.path.parent() {
-            std::fs::create_dir_all(p)?;
+        let parent = self.path.parent().filter(|path| !path.as_os_str().is_empty());
+        if let Some(parent) = parent {
+            std::fs::create_dir_all(parent)?;
         }
-        paths::write_private(&self.path, s.as_bytes())
+        paths::write_private(&self.path, s.as_bytes())?;
+        #[cfg(unix)]
+        if let Some(parent) = parent {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
     }
 }
 
@@ -282,31 +344,33 @@ fn mtime_ns(md: &std::fs::Metadata) -> i128 {
         .unwrap_or(0)
 }
 
-fn is_hidden(name: &str, _md: &std::fs::Metadata) -> bool {
-    if name.starts_with('.') {
-        return true;
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if _md.file_attributes() & 0x2 != 0 {
-            return true;
-        }
-    }
-    false
+enum ScanEvent {
+    File(FileJob),
+    Error(String),
+    Tick,
 }
 
-/// Walk one folder. Calls `on_file` for each included regular file, `on_err` for problems.
-pub fn scan_folder(
-    root: &Path,
-    key_prefix: &str,
-    excludes: &[String],
-    skip_hidden: bool,
+fn scan_folder(
+    folder: &Folder,
+    cfg: &Config,
+    resume_dir: Option<&Path>,
     cancel: &AtomicBool,
-    on_file: &mut dyn FnMut(FileJob),
-    on_err: &mut dyn FnMut(String),
+    on_event: &mut impl FnMut(ScanEvent),
 ) {
-    let mut stack: Vec<(PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
+    let root = PathBuf::from(&folder.path);
+    let mut skip_resume = None;
+    if let Some(resume_dir) = resume_dir {
+        if let Ok(resolved_root) = root.canonicalize() {
+            if resolved_root.starts_with(resume_dir) {
+                return;
+            }
+            skip_resume = resume_dir.strip_prefix(&resolved_root).ok().map(|path| root.join(path));
+        }
+    }
+    let mut stack: Vec<(PathBuf, String)> = vec![(root, String::new())];
+    let key_prefix = cfg.remote_root(folder);
+    let skip_dev_artifacts = folder.skip_dev_artifacts.unwrap_or(cfg.skip_dev_artifacts);
+    let mut last_tick = Instant::now();
     while let Some((dir, rel)) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
             return;
@@ -314,37 +378,69 @@ pub fn scan_folder(
         let rd = match std::fs::read_dir(&dir) {
             Ok(r) => r,
             Err(e) => {
-                on_err(format!("{}: {}", dir.display(), e));
+                on_event(ScanEvent::Error(format!("{}: {}", dir.display(), e)));
                 continue;
             }
         };
-        let mut items: Vec<_> = rd.filter_map(|e| e.ok()).collect();
-        items.sort_by_key(|e| e.file_name());
-        for ent in items {
-            let name = ent.file_name().to_string_lossy().to_string();
-            let rel_path = if rel.is_empty() { name.clone() } else { format!("{}/{}", rel, name) };
-            // symlink_metadata: never follow symlinks (avoids loops and escaping the folder)
-            let md = match std::fs::symlink_metadata(ent.path()) {
+        for ent in rd {
+            if cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            if last_tick.elapsed() >= Duration::from_millis(250) {
+                on_event(ScanEvent::Tick);
+                last_tick = Instant::now();
+            }
+            let ent = match ent {
+                Ok(ent) => ent,
+                Err(e) => {
+                    on_event(ScanEvent::Error(format!("{}: {}", dir.display(), e)));
+                    continue;
+                }
+            };
+            let name = ent.file_name();
+            let name = name.to_string_lossy();
+            if cfg.skip_hidden && name.starts_with('.') {
+                continue;
+            }
+            let skip_dev_dir = skip_dev_artifacts && DEV_ARTIFACT_DIRS.contains(&name.as_ref());
+            let rel_path = if rel.is_empty() { name.into_owned() } else { format!("{rel}/{name}") };
+            if cfg.excludes.iter().chain(&folder.excludes).any(|p| glob::matches(p, &rel_path)) {
+                continue;
+            }
+            let path = ent.path();
+            let md = match std::fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(e) => {
-                    on_err(format!("{}: {}", ent.path().display(), e));
+                    on_event(ScanEvent::Error(format!("{}: {}", path.display(), e)));
                     continue;
                 }
             };
             if md.file_type().is_symlink() {
                 continue;
             }
-            if skip_hidden && is_hidden(&name, &md) {
-                continue;
-            }
-            if excludes.iter().any(|p| glob::matches(p, &rel_path)) {
-                continue;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if cfg.skip_hidden && md.file_attributes() & 0x2 != 0 {
+                    continue;
+                }
             }
             if md.is_dir() {
-                stack.push((ent.path(), rel_path));
+                if !skip_dev_dir && skip_resume.as_ref() != Some(&path) {
+                    stack.push((path, rel_path));
+                }
             } else if md.is_file() {
-                on_file(FileJob { path: ent.path(), key: format!("{}{}", key_prefix, rel_path), size: md.len(), mtime_ns: mtime_ns(&md) });
+                on_event(ScanEvent::File(FileJob {
+                    path,
+                    key: format!("{key_prefix}{rel_path}"),
+                    size: md.len(),
+                    mtime_ns: mtime_ns(&md),
+                }));
             }
+        }
+        if last_tick.elapsed() >= Duration::from_millis(250) {
+            on_event(ScanEvent::Tick);
+            last_tick = Instant::now();
         }
     }
 }
@@ -376,12 +472,12 @@ impl RunLock {
                         let _ = std::fs::remove_file(&path);
                         continue;
                     }
-                    return Err("Another backup is already running.".into());
+                    return Err("Another backup or verification is already running.".into());
                 }
                 Err(e) => return Err(format!("cannot create lock file: {}", e)),
             }
         }
-        Err("Another backup is already running.".into())
+        Err("Another backup or verification is already running.".into())
     }
     fn is_stale(path: &Path) -> bool {
         let age = std::fs::metadata(path)
@@ -470,29 +566,140 @@ impl Shared {
     pub fn snapshot(&self) -> Progress {
         self.progress.lock().unwrap().clone()
     }
+    pub(crate) fn start(&self, trigger: &str) {
+        *self.progress.lock().unwrap() = Progress {
+            phase: Phase::Scanning,
+            trigger: trigger.into(),
+            started: now_secs(),
+            message: "Scanning folders…".into(),
+            ..Progress::default()
+        };
+    }
+    pub(crate) fn finish(&self, phase: Phase, message: String) -> Progress {
+        let mut p = self.progress.lock().unwrap();
+        p.phase = phase;
+        p.finished = now_secs();
+        p.message = message;
+        p.current.clear();
+        p.clone()
+    }
+}
+
+pub(crate) fn scan_backup(
+    cfg: &Config,
+    shared: &Shared,
+    cancel: &AtomicBool,
+    mut is_unchanged: impl FnMut(&FileJob) -> bool,
+    mut on_upload: impl FnMut(FileJob),
+) {
+    let resume_dir = crate::remote::upload_resume_dir();
+    let resume_dir = resume_dir.canonicalize().ok().or_else(|| {
+        // The uploader may create the resume directory after scanning starts.
+        let parent = resume_dir.parent()?.canonicalize().ok()?;
+        Some(parent.join(resume_dir.file_name()?))
+    });
+    let mut found = 0;
+    let mut skipped = 0;
+    let mut bytes_skipped = 0;
+    let publish = |found, skipped, bytes_skipped| {
+        let mut p = shared.progress.lock().unwrap();
+        p.files_found = found;
+        p.files_skipped = skipped;
+        p.bytes_skipped = bytes_skipped;
+        if p.files_to_upload == 0 {
+            p.message = format!("Scanning… {found} files");
+        }
+    };
+    for f in cfg.folders.iter().filter(|f| f.enabled) {
+        scan_folder(
+            f,
+            cfg,
+            resume_dir.as_deref(),
+            cancel,
+            &mut |event| match event {
+                ScanEvent::File(job) => {
+                    found += 1;
+                    if is_unchanged(&job) {
+                        skipped += 1;
+                        bytes_skipped += job.size;
+                    } else {
+                        {
+                            let mut p = shared.progress.lock().unwrap();
+                            p.files_to_upload += 1;
+                            p.bytes_total += job.size;
+                        }
+                        on_upload(job);
+                    }
+                }
+                ScanEvent::Error(e) => {
+                    let mut p = shared.progress.lock().unwrap();
+                    p.files_failed += 1;
+                    p.error(e);
+                }
+                ScanEvent::Tick => publish(found, skipped, bytes_skipped),
+            },
+        );
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    publish(found, skipped, bytes_skipped);
+}
+
+pub(crate) fn is_unchanged(index: &UploadIndex, job: &FileJob) -> bool {
+    index.entries.get(&job.key)
+        .is_some_and(|entry| entry.size == job.size && entry.mtime_ns == job.mtime_ns)
+}
+
+/// Estimate backup work using the current local index, without creating a queue or writing state.
+pub fn preview_backup(cfg: &Config, shared: &Shared, full: bool) -> Progress {
+    let index = UploadIndex::for_preview(cfg);
+    preview_with_index(cfg, shared, full, &index)
+}
+
+pub fn preview_with_index(cfg: &Config, shared: &Shared, full: bool, index: &UploadIndex) -> Progress {
+    let trigger = if full { "Full backup preview" } else { "Incremental backup preview" };
+    shared.start(trigger);
+    if !cfg.folders.iter().any(|f| f.enabled) {
+        return shared.finish(Phase::Failed, "No folders selected for backup.".into());
+    }
+    scan_backup(cfg, shared, &shared.cancel, |job| !full && is_unchanged(index, job), |_| {});
+    if shared.cancel.load(Ordering::Relaxed) {
+        return shared.finish(Phase::Cancelled, "Backup preview stopped.".into());
+    }
+    let p = shared.snapshot();
+    if p.files_failed > 0 {
+        shared.finish(Phase::FinishedWithErrors, format!("Preview found {} scan problem(s).", p.files_failed))
+    } else {
+        shared.finish(Phase::Finished, "Backup preview ready.".into())
+    }
 }
 
 /// Run a complete backup. Blocks until finished. Progress is published in `shared`.
+#[cfg(test)]
 pub fn run_backup(cfg: &Config, storage: Arc<dyn Storage>, shared: Arc<Shared>, trigger: &str) -> Progress {
     run_backup_mode(cfg, storage, shared, trigger, false)
 }
+#[cfg(test)]
 pub fn run_backup_full(cfg: &Config, storage: Arc<dyn Storage>, shared: Arc<Shared>, trigger: &str) -> Progress {
     run_backup_mode(cfg, storage, shared, trigger, true)
 }
+#[cfg(test)]
 fn run_backup_mode(cfg: &Config, storage: Arc<dyn Storage>, shared: Arc<Shared>, trigger: &str, full: bool) -> Progress {
-    shared.cancel.store(false, Ordering::SeqCst);
-    {
-        let mut p = shared.progress.lock().unwrap();
-        *p = Progress { phase: Phase::Scanning, trigger: trigger.into(), started: now_secs(), message: "Preparing…".into(), ..Default::default() };
-    }
+    shared.start(trigger);
+    let lock = match RunLock::acquire() {
+        Ok(l) => l,
+        Err(e) => return shared.finish(Phase::Failed, e),
+    };
+    run_backup_locked(cfg, storage, shared, trigger, full, &lock)
+}
+
+pub(crate) fn run_backup_locked(
+    cfg: &Config, storage: Arc<dyn Storage>, shared: Arc<Shared>, trigger: &str, full: bool, lock: &RunLock,
+) -> Progress {
+    shared.start(trigger);
     let finish = |phase: Phase, msg: String| -> Progress {
-        let mut p = shared.progress.lock().unwrap();
-        p.phase = phase;
-        p.finished = now_secs();
-        p.message = msg;
-        p.current.clear();
-        let out = p.clone();
-        drop(p);
+        let out = shared.finish(phase, msg);
         log_line(&format!(
             "backup {} ({}): uploaded {}, unchanged {}, failed {}, {} — {}",
             phase.as_str(), trigger, out.files_uploaded, out.files_skipped, out.files_failed,
@@ -502,190 +709,83 @@ fn run_backup_mode(cfg: &Config, storage: Arc<dyn Storage>, shared: Arc<Shared>,
         out
     };
 
-    let lock = match RunLock::acquire() {
-        Ok(l) => l,
-        Err(e) => return finish(Phase::Failed, e),
-    };
-    let folders: Vec<_> = cfg.folders.iter().filter(|f| f.enabled).cloned().collect();
-    if folders.is_empty() {
+    let folders = cfg.folders.iter().filter(|f| f.enabled).count();
+    if folders == 0 {
         return finish(Phase::Failed, "No folders selected for backup.".into());
     }
-    log_line(&format!("backup started ({}), {} folder(s)", trigger, folders.len()));
+    log_line(&format!("backup started ({}), {} folder(s)", trigger, folders));
 
-    // --- scan
-    let index_path = UploadIndex::path_for(cfg);
-    let index = UploadIndex::load_for_path(index_path, cfg);
-    // Persist invalidation before replacing any remote object, including interrupted runs.
-    if let Err(e) = index.save() { return finish(Phase::Failed, format!("Could not save upload index: {}", e)); }
-    let index = Arc::new(Mutex::new(index));
-    let mut queue: VecDeque<FileJob> = VecDeque::new();
-    let mut last_beat = Instant::now();
-    for f in &folders {
-        let root = PathBuf::from(&f.path);
-        if !root.is_dir() {
-            let mut p = shared.progress.lock().unwrap();
-            p.error(format!("Folder not found: {}", f.path));
-            p.files_failed += 1;
-            continue;
-        }
-        let prefix = cfg.remote_root(f);
-        let idx = index.lock().unwrap();
-        scan_folder(
-            &root,
-            &prefix,
-            &cfg.excludes,
-            cfg.skip_hidden,
-            &shared.cancel,
-            &mut |job| {
-                let mut p = shared.progress.lock().unwrap();
-                p.files_found += 1;
-                let unchanged = idx.entries.get(&job.key).map(|e| e.size == job.size && e.mtime_ns == job.mtime_ns).unwrap_or(false);
-                if unchanged && !full {
-                    p.files_skipped += 1;
-                } else {
-                    p.files_to_upload += 1;
-                    p.bytes_total += job.size;
-                    queue.push_back(job);
-                }
-                if p.files_found % 500 == 0 {
-                    p.message = format!("Scanning… {} files", p.files_found);
-                }
-                if last_beat.elapsed() > Duration::from_secs(2) {
-                    lock.update(&p);
-                    last_beat = Instant::now();
-                }
-            },
-            &mut |e| shared.progress.lock().unwrap().error(e),
-        );
-    }
-    if shared.cancel.load(Ordering::SeqCst) {
-        return finish(Phase::Cancelled, "Backup cancelled.".into());
-    }
-
-    // --- upload
-    {
-        let mut p = shared.progress.lock().unwrap();
-        p.phase = Phase::Uploading;
-        p.message = if p.files_to_upload == 0 {
-            "Everything is up to date.".into()
-        } else {
-            format!("Uploading {} files ({})", p.files_to_upload, crate::timefmt::human_bytes(p.bytes_total))
-        };
-        lock.update(&p);
-    }
-    let queue = Arc::new(Mutex::new(queue));
-    let workers = cfg.parallel_uploads.clamp(1, 16) as usize;
-    let dirty = Arc::new(AtomicBool::new(false));
-    let fatal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let mut handles = Vec::new();
-    for _ in 0..workers {
-        let (queue, shared, storage, index, dirty, fatal) =
-            (queue.clone(), shared.clone(), storage.clone(), index.clone(), dirty.clone(), fatal.clone());
-        handles.push(std::thread::spawn(move || {
-            let mut consecutive_failures = 0;
-            loop {
-                if shared.cancel.load(Ordering::Relaxed) {
-                    return;
-                }
-                let job = match queue.lock().unwrap().pop_front() {
-                    Some(j) => j,
-                    None => return,
-                };
-                let short = job.key.clone();
-                shared.progress.lock().unwrap().current.push(short.clone());
-                // Re-stat: the file may have changed since the scan.
-                let (size, mt) = match std::fs::metadata(&job.path) {
-                    Ok(m) => (m.len(), mtime_ns(&m)),
-                    Err(e) => {
-                        let mut p = shared.progress.lock().unwrap();
-                        p.current.retain(|c| c != &short);
-                        p.files_failed += 1;
-                        p.bytes_total = p.bytes_total.saturating_sub(job.size);
-                        p.error(format!("{}: {}", job.path.display(), e));
-                        continue;
-                    }
-                };
-                if size != job.size {
-                    let mut p = shared.progress.lock().unwrap();
-                    p.bytes_total = p.bytes_total.saturating_sub(job.size) + size;
-                }
-                let mut sent = 0u64;
-                let res = storage.upload_file(
-                    &job.key,
-                    &job.path,
-                    &mut |d| {
-                        sent += d;
-                        shared.progress.lock().unwrap().bytes_done += d;
-                    },
-                    &shared.cancel,
-                );
-                let mut p = shared.progress.lock().unwrap();
-                p.current.retain(|c| c != &short);
-                match res {
-                    Ok(etag) => {
-                        consecutive_failures = 0;
-                        p.files_uploaded += 1;
-                        // account for bytes not reported (e.g. retries reset) so totals line up
-                        if sent < size {
-                            p.bytes_done += size - sent;
-                        }
-                        drop(p);
-                        index.lock().unwrap().entries.insert(job.key.clone(), IndexEntry { size, mtime_ns: mt, etag });
-                        dirty.store(true, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        p.bytes_done = p.bytes_done.saturating_sub(sent);
-                        p.bytes_total = p.bytes_total.saturating_sub(size);
-                        if shared.cancel.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        p.files_failed += 1;
-                        p.error(format!("{}: {}", job.path.display(), e));
-                        consecutive_failures += 1;
-                        // Credentials/bucket problems fail every file the same way: stop early.
-                        let lower = e.to_lowercase();
-                        if consecutive_failures >= 3
-                            && (lower.contains("access denied") || lower.contains("accessdenied") || lower.contains("invalidaccesskeyid")
-                                || lower.contains("signaturedoesnotmatch") || lower.contains("nosuchbucket")
-                                || lower.contains("access key") || lower.contains("secret key") || lower.contains("does not exist"))
-                        {
-                            *fatal.lock().unwrap() = Some(e);
-                            shared.cancel.store(true, Ordering::SeqCst);
+    let (index, policy_changed) = UploadIndex::load_for_path(UploadIndex::path_for(cfg), cfg);
+    let index = Mutex::new(index);
+    let dirty = AtomicBool::new(false);
+    let fatal = Mutex::new(None);
+    lock.update(&shared.snapshot());
+    std::thread::scope(|scope| {
+        let (done, wait) = mpsc::channel::<()>();
+        let (index, dirty, fatal) = (&index, &dirty, &fatal);
+        let (shared, storage) = (shared.as_ref(), storage.as_ref());
+        let work = scope.spawn(move || {
+            let _done = done;
+            let mut uploads = None;
+            let mut workers = Vec::new();
+            scan_backup(cfg, shared, &shared.cancel, |job| !full && is_unchanged(&index.lock().unwrap(), job), |job| {
+                if uploads.is_none() {
+                    // Persist invalidation before touching remote objects, even if interrupted.
+                    if policy_changed {
+                        if let Err(e) = index.lock().unwrap().save() {
+                            *fatal.lock().unwrap() = Some(format!("Could not save upload index: {e}"));
+                            shared.cancel.store(true, Ordering::Relaxed);
                             return;
                         }
                     }
+                    let count = cfg.parallel_uploads.clamp(1, 16) as usize;
+                    let (tx, rx) = mpsc::sync_channel(count * 4);
+                    let rx = Arc::new(Mutex::new(rx));
+                    for _ in 0..count {
+                        let rx = rx.clone();
+                        workers.push(scope.spawn(move || upload_worker(&rx, shared, storage, index, dirty, fatal)));
+                    }
+                    uploads = Some(tx);
+                    shared.progress.lock().unwrap().message = "Scanning folders and uploading files…".into();
+                }
+                if uploads.as_ref().unwrap().send(job).is_err() {
+                    shared.cancel.store(true, Ordering::Relaxed);
+                }
+            });
+            if uploads.is_some() && !shared.cancel.load(Ordering::Relaxed) {
+                let mut p = shared.progress.lock().unwrap();
+                p.phase = Phase::Uploading;
+                p.message = format!("Uploading {} files ({})", p.files_to_upload, crate::timefmt::human_bytes(p.bytes_total));
+            }
+            drop(uploads);
+            for worker in workers {
+                if worker.join().is_err() {
+                    *fatal.lock().unwrap() = Some("An upload worker stopped unexpectedly.".into());
                 }
             }
-        }));
-    }
-    // Heartbeat + periodic index save while workers run.
-    let mut last_save = Instant::now();
-    loop {
-        if handles.iter().all(|h| h.is_finished()) {
-            break;
+        });
+        let mut last_save = Instant::now();
+        while wait.recv_timeout(Duration::from_secs(2)) == Err(mpsc::RecvTimeoutError::Timeout) {
+            lock.update(&shared.snapshot());
+            if last_save.elapsed() >= Duration::from_secs(20) && dirty.swap(false, Ordering::Relaxed) {
+                if index.lock().unwrap().save().is_err() {
+                    dirty.store(true, Ordering::Relaxed);
+                }
+                last_save = Instant::now();
+            }
         }
-        std::thread::sleep(Duration::from_millis(250));
-        if last_beat.elapsed() > Duration::from_secs(2) {
-            lock.update(&shared.progress.lock().unwrap());
-            last_beat = Instant::now();
+        if work.join().is_err() {
+            *fatal.lock().unwrap() = Some("The backup scan stopped unexpectedly.".into());
         }
-        if last_save.elapsed() > Duration::from_secs(20) && dirty.swap(false, Ordering::Relaxed) {
-            let _ = index.lock().unwrap().save();
-            last_save = Instant::now();
-        }
+    });
+    if let Err(e) = persist_uploads(&index, storage.as_ref(), dirty.load(Ordering::Relaxed)) {
+        shared.progress.lock().unwrap().error(format!("Could not save upload index: {}", e));
     }
-    for h in handles {
-        let _ = h.join();
-    }
-    let save_err = index.lock().unwrap().save().err();
     if let Some(e) = fatal.lock().unwrap().take() {
         return finish(Phase::Failed, format!("Backup stopped: {}", e));
     }
     if shared.cancel.load(Ordering::SeqCst) {
         return finish(Phase::Cancelled, "Backup cancelled.".into());
-    }
-    if let Some(e) = save_err {
-        shared.progress.lock().unwrap().error(format!("Could not save upload index: {}", e));
     }
     let p = shared.snapshot();
     if p.files_failed > 0 || !p.errors.is_empty() {
@@ -695,6 +795,109 @@ fn run_backup_mode(cfg: &Config, storage: Arc<dyn Storage>, shared: Arc<Shared>,
         finish(Phase::Finished, "Everything was already backed up.".into())
     } else {
         finish(Phase::Finished, format!("Backed up {} file(s).", p.files_uploaded))
+    }
+}
+
+fn persist_uploads(index: &Mutex<UploadIndex>, storage: &dyn Storage, dirty: bool) -> std::io::Result<()> {
+    let committed = {
+        let mut index = index.lock().unwrap();
+        if dirty {
+            index.save()?;
+        }
+        std::mem::take(&mut index.pending_receipts)
+    };
+    for key in committed {
+        storage.index_committed(&key);
+    }
+    Ok(())
+}
+
+fn upload_worker(
+    queue: &Mutex<mpsc::Receiver<FileJob>>,
+    shared: &Shared,
+    storage: &dyn Storage,
+    index: &Mutex<UploadIndex>,
+    dirty: &AtomicBool,
+    fatal: &Mutex<Option<String>>,
+) {
+    let mut consecutive_failures = 0;
+    loop {
+        if shared.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let next = queue.lock().unwrap().recv();
+        let Ok(job) = next else {
+            return;
+        };
+        if shared.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let short = job.key.clone();
+        shared.progress.lock().unwrap().current.push(short.clone());
+        // Re-stat: the file may have changed since the scan.
+        let (size, mt) = match std::fs::metadata(&job.path) {
+            Ok(m) => (m.len(), mtime_ns(&m)),
+            Err(e) => {
+                let mut p = shared.progress.lock().unwrap();
+                p.current.retain(|c| c != &short);
+                p.files_failed += 1;
+                p.bytes_total = p.bytes_total.saturating_sub(job.size);
+                p.error(format!("{}: {}", job.path.display(), e));
+                continue;
+            }
+        };
+        if size != job.size {
+            let mut p = shared.progress.lock().unwrap();
+            p.bytes_total = p.bytes_total.saturating_sub(job.size) + size;
+        }
+        let mut sent = 0u64;
+        let res = storage.upload_file(
+            &job.key,
+            &job.path,
+            &mut |d| {
+                sent += d;
+                shared.progress.lock().unwrap().bytes_done += d;
+            },
+            &shared.cancel,
+        );
+        let mut p = shared.progress.lock().unwrap();
+        p.current.retain(|c| c != &short);
+        match res {
+            Ok(etag) => {
+                consecutive_failures = 0;
+                p.files_uploaded += 1;
+                // account for bytes not reported (e.g. retries reset) so totals line up
+                if sent < size {
+                    p.bytes_done += size - sent;
+                }
+                drop(p);
+                let mut index = index.lock().unwrap();
+                index.entries.insert(job.key.clone(), IndexEntry { size, mtime_ns: mt, etag });
+                index.pending_receipts.push(job.key);
+                dirty.store(true, Ordering::Relaxed);
+            }
+            Err(e) => {
+                p.bytes_done = p.bytes_done.saturating_sub(sent);
+                p.bytes_total = p.bytes_total.saturating_sub(size);
+                if shared.cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                p.files_failed += 1;
+                p.error(format!("{}: {}", job.path.display(), e));
+                consecutive_failures += 1;
+                // Credentials/bucket problems fail every file the same way: stop early.
+                let lower = e.to_lowercase();
+                if consecutive_failures >= 3
+                    && (lower.contains("access denied") || lower.contains("accessdenied") || lower.contains("invalidaccesskeyid")
+                        || lower.contains("signaturedoesnotmatch") || lower.contains("nosuchbucket")
+                        || lower.contains("access key") || lower.contains("secret key") || lower.contains("does not exist"))
+                {
+                    *fatal.lock().unwrap() = Some(e);
+                    shared.cancel.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -711,6 +914,124 @@ mod tests {
         d
     }
 
+    #[test]
+    fn verification_rejects_an_incomplete_index_row() {
+        let root = tmpdir("verify-index");
+        let index = root.join("index.tsv");
+        std::fs::write(&index, "good\t2\t3\ttag\ndeleted\tbad\t42\ttag\n").unwrap();
+        assert_eq!(UploadIndex::load(index.clone()).entries.len(), 1);
+        assert!(UploadIndex::load_checked(index).err().unwrap().to_string().contains("line 2"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scan_excludes_private_resume_state_even_if_explicitly_selected() {
+        let root = tmpdir("resume-filter");
+        let resume = root.join(".upload-resume.tmp");
+        std::fs::create_dir_all(resume.join("slot")).unwrap();
+        std::fs::write(resume.join("slot/ciphertext"), b"private").unwrap();
+        std::fs::write(root.join("file.txt"), b"public").unwrap();
+        let mut cfg = Config::default();
+        cfg.excludes.clear();
+        cfg.add_folder(root.to_str().unwrap());
+        cfg.add_folder(resume.join("slot").to_str().unwrap());
+        let mut found = Vec::new();
+        let real_resume = resume.canonicalize().unwrap();
+        for folder in &cfg.folders {
+            scan_folder(folder, &cfg, Some(&real_resume), &AtomicBool::new(false), &mut |event| {
+                if let ScanEvent::File(file) = event {
+                    found.push(file.path);
+                }
+            });
+        }
+        assert_eq!(found, [root.join("file.txt")]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn folder_rules_filter_shared_scan_and_previews() {
+        let root = tmpdir("folder-rules");
+        let mut cfg = Config::default();
+        cfg.device_name = "pc".into();
+        cfg.skip_hidden = true;
+        cfg.excludes.push("*.global".into());
+        for folder in ["inherit", "include", "exclude", "paused"] {
+            let path = root.join(folder);
+            for rel in ["node_modules/module.js", "src/keep.txt", "src/file.local", "src/file.global", "src/.hidden"] {
+                let file = path.join(rel);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(file, b"123").unwrap();
+            }
+            cfg.add_folder(path.to_str().unwrap());
+        }
+        let mut json = cfg.to_json();
+        let mut folders = json.arr("folders").to_vec();
+        folders[1].set("skip_dev_artifacts", false);
+        folders[1].set("excludes", Json::Arr(vec![Json::from("src/*.local")]));
+        folders[2].set("skip_dev_artifacts", true);
+        folders[3].set("enabled", false);
+        json.set("folders", Json::Arr(folders));
+
+        for global in [true, false] {
+            json.set("skip_dev_artifacts", global);
+            let cfg = Config::from_json(&json);
+            let shared = Shared::new();
+            let mut keys = Vec::new();
+            scan_backup(&cfg, &shared, &shared.cancel, |_| false, |file| keys.push(file.key));
+            keys.sort_unstable();
+            let mut expected = vec![
+                "pc/exclude/src/file.local", "pc/exclude/src/keep.txt",
+                "pc/include/node_modules/module.js", "pc/include/src/keep.txt",
+                "pc/inherit/src/file.local", "pc/inherit/src/keep.txt",
+            ];
+            if !global {
+                expected.insert(4, "pc/inherit/node_modules/module.js");
+            }
+            assert_eq!(keys, expected);
+
+            let index = UploadIndex::load(root.join("unused-index.tsv"));
+            for full in [false, true] {
+                let preview = preview_with_index(&cfg, &Shared::new(), full, &index);
+                assert_eq!(preview.phase, Phase::Finished);
+                assert_eq!(preview.files_to_upload, if global { 6 } else { 7 });
+                assert_eq!(preview.bytes_total, if global { 18 } else { 21 });
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_artifact_filter_skips_subfolders_only_when_enabled() {
+        let root = tmpdir("artifact-filter");
+        for rel in [
+            "app/node_modules/package/index.js",
+            "app/build/app.js",
+            "app/dist/app.js",
+            "target/debug/stow",
+            "app/.next/cache/page",
+            "docs/build",
+            "app/src/source.js",
+        ] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"data").unwrap();
+        }
+        let index = UploadIndex::load(root.join("unused-index.tsv"));
+        let mut cfg = Config::default();
+        cfg.add_folder(root.to_str().unwrap());
+        let mut saved = cfg.to_json();
+        let default = preview_with_index(&Config::from_json(&saved), &Shared::new(), true, &index);
+        assert_eq!(default.files_to_upload, 7);
+
+        saved.set("skip_dev_artifacts", true);
+        let cfg = Config::from_json(&Config::from_json(&saved).to_json());
+        let filtered = preview_with_index(&cfg, &Shared::new(), true, &index);
+        assert_eq!(filtered.phase, Phase::Finished);
+        assert_eq!(filtered.files_to_upload, 2);
+        assert_eq!(filtered.bytes_total, 8);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     struct FlakyStorage {
         inner: LocalDirStorage,
         calls: AtomicUsize,
@@ -723,6 +1044,21 @@ mod tests {
                 return Err("simulated network error".into());
             }
             self.inner.upload_file(key, path, pr, c)
+        }
+    }
+
+    struct CreateDuringUpload {
+        inner: LocalDirStorage,
+        new_file: PathBuf,
+        first: AtomicBool,
+    }
+
+    impl Storage for CreateDuringUpload {
+        fn upload_file(&self, key: &str, path: &Path, progress: &mut dyn FnMut(u64), cancel: &AtomicBool) -> Result<String, String> {
+            if self.first.swap(false, Ordering::Relaxed) {
+                std::fs::write(&self.new_file, b"created during backup").unwrap();
+            }
+            self.inner.upload_file(key, path, progress, cancel)
         }
     }
 
@@ -764,6 +1100,23 @@ mod tests {
         assert!(!root.join("node_modules").exists());
         assert!(!RunLock::path().exists(), "lock released");
 
+        let index = UploadIndex::path_for(&cfg);
+        let before_preview = std::fs::read(&index).unwrap();
+        let lock = RunLock::acquire().unwrap();
+        let p = preview_backup(&cfg, &Shared::new(), false);
+        assert_eq!(p.phase, Phase::Finished);
+        assert_eq!(p.files_found, 4);
+        assert_eq!(p.files_to_upload, 1);
+        assert_eq!(p.bytes_total, 3);
+        assert_eq!(p.bytes_skipped, 300_012);
+        let p = preview_backup(&cfg, &Shared::new(), true);
+        assert_eq!(p.files_to_upload, 4);
+        assert_eq!(p.bytes_total, 300_015);
+        assert_eq!(p.bytes_skipped, 0);
+        assert_eq!(std::fs::read(&index).unwrap(), before_preview);
+        assert_eq!(load_history().len(), 1);
+        drop(lock);
+
         // Second run: only the failed file is retried.
         let before = storage.calls.load(Ordering::SeqCst);
         let p2 = run_backup(&cfg, storage.clone(), shared.clone(), "test");
@@ -780,6 +1133,12 @@ mod tests {
         assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"hello again");
         assert_eq!(load_history().len(), 3);
 
+        let before = std::fs::metadata(&index).unwrap().modified().unwrap();
+        let clean = run_backup(&cfg, storage.clone(), Shared::new(), "test");
+        assert_eq!(clean.phase, Phase::Finished);
+        assert_eq!(clean.files_skipped, 3);
+        assert_eq!(std::fs::metadata(&index).unwrap().modified().unwrap(), before);
+
         let full = run_backup_full(&cfg, storage.clone(), shared.clone(), "test-full");
         assert_eq!(full.files_uploaded, 3);
         assert_eq!(full.files_skipped, 0);
@@ -789,6 +1148,36 @@ mod tests {
         let p4 = run_backup(&cfg, storage.clone(), shared.clone(), "test");
         assert_eq!(p4.phase, Phase::Failed);
         drop(l);
+        assert_eq!(load_history().len(), 5);
+
+        // The first directory fills the small queue before the second directory is reached.
+        let first = tmpdir("stream-first");
+        let second = tmpdir("stream-second");
+        for i in 0..20 {
+            std::fs::write(first.join(format!("{i}.txt")), b"data").unwrap();
+        }
+        let mut streaming_cfg = Config::default();
+        streaming_cfg.s3.bucket = "streaming-test".into();
+        streaming_cfg.parallel_uploads = 1;
+        streaming_cfg.add_folder(first.to_str().unwrap());
+        streaming_cfg.add_folder(second.to_str().unwrap());
+        let streaming = Arc::new(CreateDuringUpload {
+            inner: LocalDirStorage(dst.clone()),
+            new_file: second.join("new.txt"),
+            first: AtomicBool::new(true),
+        });
+        let p = run_backup(&streaming_cfg, streaming, Shared::new(), "test-streaming");
+        assert_eq!(p.phase, Phase::Finished);
+        assert_eq!(p.files_uploaded, 21);
+        let preview = preview_backup(&streaming_cfg, &Shared::new(), false);
+        assert_eq!(preview.bytes_skipped, 101);
+        assert_eq!(preview.bytes_total, 0);
+
+        let stopped = Shared::new();
+        stopped.cancel.store(true, Ordering::Relaxed);
+        let cancelled = preview_backup(&streaming_cfg, &stopped, false);
+        assert_eq!(cancelled.phase, Phase::Cancelled);
+        assert_eq!(cancelled.files_found, 0);
         std::env::remove_var("BACKUP_TAKER_HOME");
     }
 
@@ -796,17 +1185,21 @@ mod tests {
     fn encryption_policy_invalidates_index_on_every_transition() {
         let d = tmpdir("policy"); let path = d.join("index.tsv");
         let mut cfg = Config::default();
-        let mut first = UploadIndex::load_for_path(path.clone(), &cfg);
+        let (mut first, policy_changed) = UploadIndex::load_for_path(path.clone(), &cfg);
+        assert!(policy_changed);
         first.entries.insert("file".into(), IndexEntry { size: 5, mtime_ns: 1, etag: "e".into() });
         first.save().unwrap();
-        assert_eq!(UploadIndex::load_for_path(path.clone(), &cfg).entries.len(), 1);
+        let (loaded, policy_changed) = UploadIndex::load_for_path(path.clone(), &cfg);
+        assert!(!policy_changed);
+        assert_eq!(loaded.entries.len(), 1);
         cfg.s3.client_encryption = true; cfg.s3.recovery_key = "ab".repeat(32);
-        let mut second = UploadIndex::load_for_path(path.clone(), &cfg);
+        let (mut second, policy_changed) = UploadIndex::load_for_path(path.clone(), &cfg);
+        assert!(policy_changed);
         assert!(second.entries.is_empty());
         second.entries.insert("file".into(), IndexEntry { size: 5, mtime_ns: 1, etag: "encrypted".into() });
         second.save().unwrap();
         cfg.s3.client_encryption = false;
-        assert!(UploadIndex::load_for_path(path, &cfg).entries.is_empty());
+        assert!(UploadIndex::load_for_path(path, &cfg).0.entries.is_empty());
     }
 
     #[test]

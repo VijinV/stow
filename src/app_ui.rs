@@ -1,8 +1,10 @@
 //! The desktop window: Overview, Folders, Storage (S3), Schedule and History pages.
 use crate::config::{Config, ScheduleMode};
-use crate::engine::{self, Phase, Progress, Shared};
+use crate::engine::{self, Phase, Progress, Shared, UploadIndex};
 use crate::timefmt::{ago, format_local, human_bytes, human_duration, now_secs};
 use bt_gui::*;
+use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -11,15 +13,18 @@ enum Page {
     Overview,
     Folders,
     Storage,
+    Encryption,
+    Dashboard,
     Schedule,
     History,
     Browse,
+    Verify,
 }
 
 /// Result slot for work done on a background thread.
-type Slot<T> = Arc<Mutex<Option<T>>>;
+pub(crate) type Slot<T> = Arc<Mutex<Option<T>>>;
 
-fn spawn_job<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Slot<T> {
+pub(crate) fn spawn_job<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Slot<T> {
     let slot: Slot<T> = Arc::new(Mutex::new(None));
     let s2 = slot.clone();
     std::thread::spawn(move || {
@@ -29,12 +34,24 @@ fn spawn_job<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Slot<
     slot
 }
 
-fn take<T>(slot: &mut Option<Slot<T>>) -> Option<T> {
+pub(crate) fn take<T>(slot: &mut Option<Slot<T>>) -> Option<T> {
     let r = slot.as_ref()?.lock().unwrap().take();
     if r.is_some() {
         *slot = None;
     }
     r
+}
+
+struct FolderScan {
+    path: String,
+    shared: Arc<Shared>,
+    result: Slot<(Progress, Arc<UploadIndex>)>,
+}
+
+struct FolderRulesDraft {
+    path: String,
+    excludes_text: String,
+    dev_preset: usize,
 }
 
 const PROVIDERS: &[&str] = &[
@@ -156,7 +173,13 @@ impl Draft {
         }
     }
 
+    fn apply_local_encryption(&self, cfg: &mut Config) {
+        cfg.s3.client_encryption = self.client_encryption;
+        cfg.s3.recovery_key = self.recovery_key.trim().to_string();
+    }
+
     fn apply_to(&self, cfg: &mut Config) {
+        self.apply_local_encryption(cfg);
         let s = &mut cfg.s3;
         s.endpoint = if self.provider == 0 {
             String::new()
@@ -183,8 +206,6 @@ impl Draft {
             String::new()
         };
         s.ca_file = self.ca_file.trim().to_string();
-        s.client_encryption = self.client_encryption;
-        s.recovery_key = self.recovery_key.trim().to_string();
         s.server_encryption = ["", "AES256", "aws:kms"][self.server_encryption].into();
         s.kms_key_id = if self.server_encryption == 2 {
             self.kms_key_id.trim().to_string()
@@ -218,6 +239,10 @@ struct App {
     browser: Option<FolderBrowser>,
     confirm_remove: Option<usize>,
     excludes_text: String,
+    folder_rules: Option<FolderRulesDraft>,
+    folder_scan: Option<FolderScan>,
+    folder_sizes: HashMap<String, Progress>,
+    folder_index: Option<Arc<UploadIndex>>,
     // schedule
     sched_mode: usize,
     sched_interval: usize,
@@ -229,8 +254,11 @@ struct App {
     history: Vec<Progress>,
     history_loaded: Instant,
     confirm_quit: bool,
+    quit_after_backup: bool,
     show_errors: bool,
     cloud: crate::browser_ui::BrowserView,
+    verification: crate::verify_ui::VerifyView,
+    dashboard: crate::managed_ui::View,
     full_backup: bool,
 }
 
@@ -303,13 +331,20 @@ impl App {
             bucket_pick: 0,
             browser: None,
             confirm_remove: None,
+            folder_rules: None,
+            folder_scan: None,
+            folder_sizes: HashMap::new(),
+            folder_index: None,
             sched_job: None,
             sched_status: None,
             history: engine::load_history(),
             history_loaded: Instant::now(),
             confirm_quit: false,
+            quit_after_backup: false,
             show_errors: false,
             cloud: crate::browser_ui::BrowserView::new(),
+            verification: crate::verify_ui::VerifyView::default(),
+            dashboard: crate::managed_ui::View::default(),
             full_backup: false,
         }
     }
@@ -324,20 +359,107 @@ impl App {
         }
     }
 
+    fn save_folder_settings(&mut self, ui: &mut Ui, cfg: Config) -> bool {
+        let previous = std::mem::replace(&mut self.cfg, cfg);
+        if self.save(ui) {
+            true
+        } else {
+            self.cfg = previous;
+            false
+        }
+    }
+
+    fn save_folder_rules(&mut self, ui: &mut Ui, i: usize, excludes: Vec<String>, skip_dev_artifacts: Option<bool>) -> bool {
+        let mut cfg = self.cfg.clone();
+        let folder = &mut cfg.folders[i];
+        folder.excludes = excludes;
+        folder.skip_dev_artifacts = skip_dev_artifacts;
+        let path = folder.path.clone();
+        if self.save_folder_settings(ui, cfg) {
+            self.forget_folder_size(&path);
+            true
+        } else {
+            false
+        }
+    }
+
     fn running(&self) -> bool {
         self.backup_job.is_some()
     }
 
+    fn stop_before_quit(&mut self) {
+        self.confirm_quit = false;
+        self.quit_after_backup = true;
+        self.shared.cancel.store(true, Ordering::SeqCst);
+    }
+
+    fn ready_to_quit(&self) -> bool {
+        self.quit_after_backup && !self.running() && !self.verification.busy() && !self.cloud.busy()
+    }
+
+    fn refresh_folder_sizes(&mut self) {
+        self.folder_sizes.clear();
+        self.folder_index = None;
+        if let Some(scan) = &self.folder_scan {
+            scan.shared.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn forget_folder_size(&mut self, path: &str) {
+        self.folder_sizes.remove(path);
+        if let Some(scan) = self.folder_scan.as_ref().filter(|scan| scan.path == path) {
+            scan.shared.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn poll_folder_scan(&mut self, ui: &mut Ui) {
+        if let Some(scan) = &self.folder_scan {
+            let result = scan.result.lock().unwrap().take();
+            if let Some((progress, index)) = result {
+                if !scan.shared.cancel.load(Ordering::Relaxed) {
+                    self.folder_sizes.insert(scan.path.clone(), progress);
+                    self.folder_index = Some(index);
+                }
+                self.folder_scan = None;
+                ui.request_repaint();
+            }
+        }
+        if self.folder_scan.is_none() && self.page == Page::Folders
+            && !self.running() && !self.verification.busy() && self.external.is_none()
+        {
+            if let Some(folder) = self.cfg.folders.iter().rev()
+                .find(|f| f.enabled && !self.folder_sizes.contains_key(&f.path))
+            {
+                let path = folder.path.clone();
+                let shared = Shared::new();
+                let worker = shared.clone();
+                let Ok(mut cfg) = self.dashboard.effective(&self.cfg) else { return };
+                cfg.folders.retain(|f| f.path == path);
+                let cached = self.folder_index.take();
+                let result = spawn_job(move || {
+                    let index = cached.unwrap_or_else(|| Arc::new(UploadIndex::for_preview(&cfg)));
+                    (engine::preview_with_index(&cfg, &worker, false, &index), index)
+                });
+                self.folder_scan = Some(FolderScan { path, shared, result });
+            } else {
+                self.folder_index = None;
+            }
+        }
+        if self.folder_scan.is_some() {
+            ui.request_repaint_after(Duration::from_millis(150));
+        }
+    }
+
     fn start_backup(&mut self, ui: &mut Ui) {
-        if self.running() {
+        if self.running() || self.quit_after_backup {
             return;
         }
-        if !self.cfg.s3.is_complete() {
+        if !self.dashboard.selected() && !self.cfg.s3.is_complete() {
             ui.toast(
                 Tone::Warning,
-                "Connect your S3 bucket first (Storage page).",
+                "Pair with your dashboard before backing up.",
             );
-            self.page = Page::Storage;
+            self.page = Page::Dashboard;
             return;
         }
         if !self.cfg.folders.iter().any(|f| f.enabled) {
@@ -345,18 +467,13 @@ impl App {
             self.page = Page::Folders;
             return;
         }
-        if self.external.is_some() {
-            ui.toast(Tone::Info, "A scheduled backup is already running.");
+        if self.external.is_some() || self.verification.busy() {
+            ui.toast(Tone::Info, "A backup or verification is already running.");
             return;
         }
-        let storage = match crate::remote::S3Storage::new(&self.cfg) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                ui.toast(Tone::Danger, &e);
-                return;
-            }
-        };
         let cfg = self.cfg.clone();
+        self.refresh_folder_sizes();
+        self.shared = Shared::new();
         let shared = self.shared.clone();
         *shared.progress.lock().unwrap() = Progress {
             phase: Phase::Scanning,
@@ -369,16 +486,18 @@ impl App {
         let full = self.full_backup;
         self.full_backup = false;
         self.backup_job = Some(spawn_job(move || {
-            if full {
-                engine::run_backup_full(&cfg, storage, shared, "manual full")
-            } else {
-                engine::run_backup(&cfg, storage, shared, "manual")
-            }
+            let trigger = if full { "manual full" } else { "manual" };
+            crate::managed::backup(&cfg, shared, trigger, full)
         }));
     }
 
     fn poll(&mut self, ui: &mut Ui) {
+        if self.dashboard.poll(ui, &self.cfg) {
+            self.refresh_folder_sizes();
+            self.cloud.invalidate();
+        }
         if let Some(p) = take(&mut self.backup_job) {
+            self.refresh_folder_sizes();
             self.cloud.invalidate();
             let tone = match p.phase {
                 Phase::Finished => Tone::Success,
@@ -416,13 +535,16 @@ impl App {
             self.sched_status = Some(r);
         }
         // A backup started by the OS scheduler (another process)?
-        if !self.running() && self.last_external_check.elapsed() > Duration::from_secs(2) {
+        if self.verification.busy() {
+            self.external = None;
+        } else if !self.running() && self.last_external_check.elapsed() > Duration::from_secs(2) {
             self.last_external_check = Instant::now();
             let was = self.external.is_some();
             self.external = engine::RunLock::read_active()
                 .filter(|p| p.phase.is_running() || p.phase == Phase::Idle);
             if was && self.external.is_none() {
                 self.history = engine::load_history();
+                self.refresh_folder_sizes();
             }
         }
         if self.history_loaded.elapsed() > Duration::from_secs(30) {
@@ -495,11 +617,19 @@ fn frame(ui: &mut Ui, app: &mut App) {
         ui.small("Your files, safely kept.");
         ui.space(12.0);
         ui.set_spacing(4.0);
+        let managed = app.dashboard.selected();
+        let storage = if !managed && app.cfg.s3.is_complete() {
+            (Icon::Cloud, "Storage", Page::Storage)
+        } else {
+            (Icon::Key, "Encryption", Page::Encryption)
+        };
         let items = [
             (Icon::Home, "Overview", Page::Overview),
             (Icon::Folder, "Folders", Page::Folders),
-            (Icon::Cloud, "Storage", Page::Storage),
-            (Icon::Folder, "Browse S3", Page::Browse),
+            (Icon::Cloud, "Dashboard", Page::Dashboard),
+            storage,
+            (Icon::Folder, "Browse backups", Page::Browse),
+            (Icon::Check, "Verify", Page::Verify),
             (Icon::Clock, "Schedule", Page::Schedule),
             (Icon::Calendar, "History", Page::History),
         ];
@@ -513,7 +643,9 @@ fn frame(ui: &mut Ui, app: &mut App) {
     let foot = Rect::new(14.0, h - 74.0, side.w - 28.0, 60.0);
     ui.with_rect(foot, |ui| {
         ui.set_spacing(2.0);
-        let (tone, text) = if app.cfg.s3.is_complete() {
+        let (tone, text) = if app.dashboard.selected() {
+            (Tone::Success, "Dashboard-managed".to_string())
+        } else if app.cfg.s3.is_complete() {
             (Tone::Success, format!("Bucket: {}", app.cfg.s3.bucket))
         } else {
             (Tone::Warning, "Storage not connected".to_string())
@@ -524,19 +656,48 @@ fn frame(ui: &mut Ui, app: &mut App) {
 
     // ---------------- content
     let content = Rect::new(side.right(), 0.0, w - side.right(), h);
+    let backup_running = app.running() || app.external.is_some();
+    let effective = if matches!(app.page, Page::Browse | Page::Verify) || app.cloud.busy() {
+        app.dashboard.effective(&app.cfg)
+    } else {
+        Ok(app.cfg.clone())
+    };
     ui.with_rect(content.shrink2(32.0, 26.0), |ui| {
         ui.scroll_area("page", None, |ui| match app.page {
             Page::Overview => overview_page(ui, app),
             Page::Folders => folders_page(ui, app),
-            Page::Storage => storage_page(ui, app),
+            Page::Storage if !app.dashboard.selected() => storage_page(ui, app),
+            Page::Storage | Page::Encryption => encryption_page(ui, app),
+            Page::Dashboard => {
+                if app.dashboard.show(ui, &app.cfg, backup_running || app.verification.busy() || app.cloud.busy()) {
+                    app.refresh_folder_sizes();
+                    app.cloud.invalidate();
+                }
+                if !app.dashboard.selected() && !app.cfg.s3.is_complete() {
+                    ui.space(8.0);
+                    if ui.link("Set up standalone storage").clicked {
+                        app.page = Page::Storage;
+                    }
+                }
+            }
             Page::Schedule => schedule_page(ui, app),
             Page::History => history_page(ui, app),
-            Page::Browse => app.cloud.show(ui, &app.cfg),
+            Page::Browse => match &effective {
+                Ok(cfg) => app.cloud.show(ui, cfg),
+                Err(error) => ui.callout(Tone::Warning, error),
+            },
+            Page::Verify => match &effective {
+                Ok(cfg) => app.verification.show(ui, cfg, backup_running),
+                Err(error) => ui.callout(Tone::Warning, error),
+            },
         });
     });
 
+    app.poll_folder_scan(ui);
+    app.verification.poll(ui);
     // ---------------- overlays
-    app.cloud.poll(ui, &app.cfg);
+    app.cloud.poll(ui, effective.as_ref().unwrap_or(&app.cfg));
+    folder_rules_dialog(ui, app);
     if let Some(i) = app.confirm_remove {
         let name = app
             .cfg
@@ -557,8 +718,10 @@ fn frame(ui: &mut Ui, app: &mut App) {
                 ui.right_to_left(|ui| {
                     if ui.danger_button("Remove").clicked {
                         if i < app.cfg.folders.len() {
-                            app.cfg.folders.remove(i);
-                            if app.save(ui) {
+                            let mut cfg = app.cfg.clone();
+                            let removed = cfg.folders.remove(i);
+                            if app.save_folder_settings(ui, cfg) {
+                                app.forget_folder_size(&removed.path);
                                 ui.toast(Tone::Success, "Folder removed");
                             }
                         }
@@ -584,8 +747,15 @@ fn frame(ui: &mut Ui, app: &mut App) {
             }
         }
     }
-    if ui.close_requested() {
-        if app.cloud.busy() {
+    if app.ready_to_quit() {
+        ui.quit();
+        return;
+    }
+    if ui.close_requested() && !app.quit_after_backup {
+        if app.verification.busy() {
+            app.page = Page::Verify;
+            ui.toast(Tone::Warning, "Stop verification or wait for it to finish before closing.");
+        } else if app.cloud.busy() {
             ui.toast(
                 Tone::Warning,
                 "Wait for the preview or restore to finish, or cancel the restore before closing.",
@@ -598,17 +768,12 @@ fn frame(ui: &mut Ui, app: &mut App) {
     }
     if app.confirm_quit {
         let r = ui.modal("confirm-quit", "A backup is running", 460.0, |ui| {
-            ui.label_wrapped("Quitting now stops the backup. Files uploaded so far are kept, and the next backup continues where this one stopped.");
+            ui.label_wrapped("Stow will stop the backup and save its progress before closing. The next backup reuses completed uploads and any resumable parts.");
             ui.space(6.0);
             ui.right_to_left(|ui| {
                 if ui.danger_button("Stop and quit").clicked {
-                    app.shared.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-                    // give workers a moment to abort multipart uploads cleanly
-                    let t = Instant::now();
-                    while app.backup_job.as_ref().map(|s| s.lock().unwrap().is_none()).unwrap_or(false) && t.elapsed() < Duration::from_secs(5) {
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    ui.quit();
+                    app.stop_before_quit();
+                    app.page = Page::Overview;
                 }
                 if ui.button("Keep running").clicked {
                     app.confirm_quit = false;
@@ -625,12 +790,17 @@ fn add_folder(ui: &mut Ui, app: &mut App, p: std::path::PathBuf) {
     let s = p.to_string_lossy().to_string();
     if !p.is_dir() {
         ui.toast(Tone::Danger, "That is not a folder.");
-    } else if app.cfg.add_folder(&s) {
-        if app.save(ui) {
-            ui.toast(Tone::Success, &format!("Added {}", s));
-        }
-    } else {
+        return;
+    }
+    let mut cfg = app.cfg.clone();
+    if !cfg.add_folder(&s) {
         ui.toast(Tone::Info, "That folder is already in the list.");
+    } else if app.save_folder_settings(ui, cfg) {
+        ui.toast(Tone::Success, &format!("Added {}", s));
+        if let Some(scan) = &app.folder_scan {
+            scan.shared.cancel.store(true, Ordering::Relaxed);
+        }
+        app.poll_folder_scan(ui);
     }
 }
 
@@ -651,7 +821,9 @@ fn overview_page(ui: &mut Ui, app: &mut App) {
         "Your folders are copied to your S3 bucket. Only new and changed files are uploaded.",
     );
 
-    let configured = app.cfg.s3.is_complete();
+    let managed = app.dashboard.selected();
+    let standalone_configured = !managed && app.cfg.s3.is_complete();
+    let configured = managed || standalone_configured;
     let has_folders = app.cfg.folders.iter().any(|f| f.enabled);
     let ever_ran = !app.history.is_empty();
     if !configured || !has_folders || !ever_ran {
@@ -667,9 +839,11 @@ fn overview_page(ui: &mut Ui, app: &mut App) {
                 ),
                 (
                     configured,
-                    "Connect your S3 bucket",
-                    "Enter your Access Key, Secret and bucket name.",
-                    Page::Storage,
+                    "Connect backup storage",
+                    if managed { "The dashboard provides the destination." }
+                    else if standalone_configured { "This device uses its saved storage settings." }
+                    else { "Pair this installation with your dashboard." },
+                    if standalone_configured { Page::Storage } else { Page::Dashboard },
                 ),
                 (
                     ever_ran,
@@ -728,7 +902,9 @@ fn overview_page(ui: &mut Ui, app: &mut App) {
             let external = !app.running();
             ui.horizontal(|ui| {
                 ui.icon(Icon::Upload, 22.0, ui.theme.accent);
-                ui.subheading(if external {
+                ui.subheading(if p.trigger == crate::verify::TRIGGER {
+                    "Verification in progress"
+                } else if external {
                     "Scheduled backup in progress"
                 } else {
                     "Backing up…"
@@ -805,7 +981,7 @@ fn overview_page(ui: &mut Ui, app: &mut App) {
             if p.files_failed > 0 {
                 ui.callout(
                     Tone::Warning,
-                    &format!("{} file(s) could not be uploaded so far.", p.files_failed),
+                    &format!("{} scan or upload problem(s) so far.", p.files_failed),
                 );
             }
         }
@@ -854,7 +1030,16 @@ fn overview_page(ui: &mut Ui, app: &mut App) {
                 });
                 ui.right_to_left(|ui| {
                     if ui
-                        .button_ex("Back up now", ButtonKind::Primary, Some(Icon::Upload), true)
+                        .button_ex(
+                            if last.as_ref().is_some_and(|p| p.phase == Phase::Cancelled) && !app.full_backup {
+                                "Resume backup"
+                            } else {
+                                "Back up now"
+                            },
+                            ButtonKind::Primary,
+                            Some(Icon::Upload),
+                            !app.quit_after_backup,
+                        )
                         .clicked
                     {
                         app.start_backup(ui);
@@ -867,7 +1052,7 @@ fn overview_page(ui: &mut Ui, app: &mut App) {
                     0 => stat(ui, "Uploaded", &p.files_uploaded.to_string()),
                     1 => stat(ui, "Unchanged", &p.files_skipped.to_string()),
                     2 => stat(ui, "Failed", &p.files_failed.to_string()),
-                    _ => stat(ui, "Data sent", &human_bytes(p.bytes_done)),
+                    _ => stat(ui, "Data backed up", &human_bytes(p.bytes_done)),
                 });
                 if !p.errors.is_empty() {
                     ui.space(2.0);
@@ -925,14 +1110,24 @@ fn overview_page(ui: &mut Ui, app: &mut App) {
             }
             1 => {
                 ui.small("DESTINATION");
-                let d = if app.cfg.s3.bucket.is_empty() {
-                    "Not connected".to_string()
-                } else {
+                let destination = if managed {
+                    app.dashboard.effective(&app.cfg).map_or_else(
+                        |_| "Dashboard-managed".to_string(),
+                        |cfg| format!("s3://{}", cfg.s3.bucket),
+                    )
+                } else if standalone_configured {
                     format!("s3://{}", app.cfg.s3.bucket)
+                } else {
+                    "Not connected".to_string()
                 };
-                ui.subheading(&d);
-                if ui.link("Storage settings").clicked {
-                    app.page = Page::Storage;
+                ui.subheading(&destination);
+                let (label, page) = if standalone_configured {
+                    ("Storage settings", Page::Storage)
+                } else {
+                    ("Dashboard settings", Page::Dashboard)
+                };
+                if ui.link(label).clicked {
+                    app.page = page;
                 }
             }
             _ => {
@@ -964,7 +1159,7 @@ fn folders_page(ui: &mut Ui, app: &mut App) {
         ui.vertical(Some(ui.available_width() - 180.0), |ui| {
             ui.set_spacing(2.0);
             ui.heading("Folders");
-            ui.label_muted("Everything inside these folders (including sub-folders) is backed up.");
+            ui.label_muted("Backup rules apply to each folder and its subfolders.");
         });
         ui.right_to_left(|ui| {
             if ui
@@ -983,6 +1178,16 @@ fn folders_page(ui: &mut Ui, app: &mut App) {
     });
     ui.space(10.0);
     ui.card(|ui| {
+        if !app.cfg.folders.is_empty() {
+            ui.horizontal(|ui| {
+                ui.small("Sizes reflect backup filters and the local upload index.");
+                ui.right_to_left(|ui| {
+                    if ui.button("Refresh sizes").clicked {
+                        app.refresh_folder_sizes();
+                    }
+                });
+            });
+        }
         if app.cfg.folders.is_empty() {
             ui.horizontal_sized(60.0, |ui| {
                 ui.icon(Icon::Folder, 28.0, ui.theme.text_faint);
@@ -990,7 +1195,7 @@ fn folders_page(ui: &mut Ui, app: &mut App) {
             });
         }
         let mut remove = None;
-        let mut changed = false;
+        let mut toggled = Vec::new();
         let roots: Vec<String> = app
             .cfg
             .folders
@@ -998,10 +1203,9 @@ fn folders_page(ui: &mut Ui, app: &mut App) {
             .map(|f| app.cfg.remote_root(f))
             .collect();
         let bucket = app.cfg.s3.bucket.clone();
-        for (i, f) in app.cfg.folders.iter_mut().enumerate() {
+        for (i, f) in app.cfg.folders.iter().enumerate() {
             ui.with_id(i, |ui| {
-                ui.row(i, 60.0, false, |ui| {
-                    let exists = std::path::Path::new(&f.path).is_dir();
+                ui.row(i, 80.0, false, |ui| {
                     ui.icon(
                         Icon::Folder,
                         24.0,
@@ -1011,7 +1215,7 @@ fn folders_page(ui: &mut Ui, app: &mut App) {
                             ui.theme.text_faint
                         },
                     );
-                    ui.vertical(Some(ui.available_width() - 210.0), |ui| {
+                    ui.vertical(Some(ui.available_width() - 230.0), |ui| {
                         ui.set_spacing(0.0);
                         ui.text(&f.path, TextStyle::body().bold());
                         let dest = if bucket.is_empty() {
@@ -1020,6 +1224,27 @@ fn folders_page(ui: &mut Ui, app: &mut App) {
                             format!("s3://{}/{}", bucket, roots[i])
                         };
                         ui.small(&format!("→ {}", dest));
+                        if !f.enabled {
+                            ui.small("Paused");
+                        } else if let Some(p) = app.folder_sizes.get(&f.path) {
+                            ui.small(&format!(
+                                "Size {} · Synced {} · Pending {}",
+                                human_bytes(p.bytes_skipped + p.bytes_total),
+                                human_bytes(p.bytes_skipped),
+                                human_bytes(p.bytes_total),
+                            ));
+                            if p.files_failed > 0 {
+                                let error = p.errors.first().map_or("Scan incomplete", String::as_str);
+                                ui.text(error, TextStyle::body().size(12.0).color(ui.theme.danger));
+                            }
+                        } else if let Some(scan) = app.folder_scan.as_ref().filter(|scan| {
+                            scan.path == f.path && !scan.shared.cancel.load(Ordering::Relaxed)
+                        }) {
+                            let found = scan.shared.progress.lock().unwrap().files_found;
+                            ui.small(&format!("Scanning… {found} files"));
+                        } else {
+                            ui.small("Waiting to scan");
+                        }
                     });
                     ui.right_to_left(|ui| {
                         let b = ui.icon_button(Icon::Trash);
@@ -1027,18 +1252,36 @@ fn folders_page(ui: &mut Ui, app: &mut App) {
                         if b.clicked {
                             remove = Some(i);
                         }
-                        if ui.toggle(&mut f.enabled, "").changed {
-                            changed = true;
+                        let mut enabled = f.enabled;
+                        if ui.toggle(&mut enabled, "").changed {
+                            toggled.push((i, enabled));
                         }
-                        if !exists {
-                            ui.badge("Missing", Tone::Danger);
+                        if ui.button("Backup rules").clicked {
+                            app.folder_rules = Some(FolderRulesDraft {
+                                path: f.path.clone(),
+                                excludes_text: f.excludes.join(", "),
+                                dev_preset: match f.skip_dev_artifacts {
+                                    None => 0,
+                                    Some(true) => 1,
+                                    Some(false) => 2,
+                                },
+                            });
                         }
                     });
                 });
             });
         }
-        if changed {
-            app.save(ui);
+        if !toggled.is_empty() {
+            let mut cfg = app.cfg.clone();
+            for &(i, enabled) in &toggled {
+                cfg.folders[i].enabled = enabled;
+            }
+            if app.save_folder_settings(ui, cfg) {
+                for (i, _) in toggled {
+                    let path = app.cfg.folders[i].path.clone();
+                    app.forget_folder_size(&path);
+                }
+            }
         }
         if remove.is_some() {
             app.confirm_remove = remove;
@@ -1046,9 +1289,22 @@ fn folders_page(ui: &mut Ui, app: &mut App) {
     });
     ui.space(8.0);
     ui.card(|ui| {
-        ui.subheading("Skip these files");
+        ui.subheading("Global backup rules");
+        let previous = (app.cfg.skip_hidden, app.cfg.skip_dev_artifacts);
+        let (mut skip_hidden, mut skip_dev_artifacts) = previous;
+        ui.checkbox(&mut skip_dev_artifacts, "Skip dependencies and build output");
+        ui.small(&format!("Skips subfolders named {}.", crate::config::DEV_ARTIFACT_DIRS.join(", ")));
+        ui.checkbox(&mut skip_hidden, "Skip hidden files and folders");
+        if (skip_hidden, skip_dev_artifacts) != previous {
+            let mut cfg = app.cfg.clone();
+            cfg.skip_hidden = skip_hidden;
+            cfg.skip_dev_artifacts = skip_dev_artifacts;
+            if app.save_folder_settings(ui, cfg) {
+                app.refresh_folder_sizes();
+            }
+        }
         ui.label_muted(
-            "Comma-separated names or patterns. Examples: node_modules, *.tmp, cache/**",
+            "Custom exclusions use comma-separated names or patterns, such as *.tmp or cache/**.",
         );
         ui.text_input(
             "excludes",
@@ -1058,39 +1314,119 @@ fn folders_page(ui: &mut Ui, app: &mut App) {
                 ..Default::default()
             },
         );
-        let mut skip_hidden = app.cfg.skip_hidden;
-        ui.checkbox(&mut skip_hidden, "Skip hidden files and folders");
-        let new_ex: Vec<String> = app
-            .excludes_text
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        let dirty = new_ex != app.cfg.excludes || skip_hidden != app.cfg.skip_hidden;
+        let new_ex = exclusion_patterns(&app.excludes_text, &app.cfg.excludes);
+        let dirty = new_ex != app.cfg.excludes;
         ui.horizontal(|ui| {
             if ui
                 .button_ex("Save", ButtonKind::Primary, None, dirty)
                 .clicked
             {
-                app.cfg.excludes = new_ex.clone();
-                app.cfg.skip_hidden = skip_hidden;
-                if app.save(ui) {
+                let mut cfg = app.cfg.clone();
+                cfg.excludes = new_ex;
+                if app.save_folder_settings(ui, cfg) {
+                    app.refresh_folder_sizes();
                     ui.toast(Tone::Success, "Saved");
                 }
             }
-            if ui.button("Reset to defaults").clicked {
+            if ui.button("Reset patterns to defaults").clicked {
                 app.excludes_text = crate::config::DEFAULT_EXCLUDES.join(", ");
             }
         });
-        // Checkbox state is shown from config; persist it immediately for simplicity.
-        if skip_hidden != app.cfg.skip_hidden {
-            app.cfg.skip_hidden = skip_hidden;
-            app.save(ui);
-        }
     });
 }
 
+fn exclusion_patterns(text: &str, saved: &[String]) -> Vec<String> {
+    if text == saved.join(", ") {
+        return saved.to_vec();
+    }
+    text.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect()
+}
+
+fn folder_rules_dialog(ui: &mut Ui, app: &mut App) {
+    let Some(mut draft) = app.folder_rules.take() else { return };
+    let Some(i) = app.cfg.folders.iter().position(|f| f.path == draft.path) else { return };
+    let mut close = false;
+    let response = ui.modal("folder-rules", "Backup rules", 500.0, |ui| {
+        ui.label_wrapped(&draft.path);
+        ui.label("Extra exclusions");
+        ui.text_input(
+            "folder-excludes",
+            &mut draft.excludes_text,
+            &TextInputOptions { placeholder: "*.bak, cache/**", ..Default::default() },
+        );
+        ui.label_wrapped("Separate names or patterns with commas. Global patterns and hidden-file rules still apply.");
+        ui.label("Dependencies and build output");
+        let inherit = if app.cfg.skip_dev_artifacts { "Use global (skip)" } else { "Use global (include)" };
+        ui.segmented(&mut draft.dev_preset, &[inherit, "Skip", "Include"]);
+        let skip_dev_artifacts = [None, Some(true), Some(false)][draft.dev_preset];
+        let folder = &app.cfg.folders[i];
+        let excludes = exclusion_patterns(&draft.excludes_text, &folder.excludes);
+        let dirty = excludes != folder.excludes || skip_dev_artifacts != folder.skip_dev_artifacts;
+        ui.right_to_left(|ui| {
+            if ui.button_ex("Save rules", ButtonKind::Primary, None, dirty).clicked
+                && app.save_folder_rules(ui, i, excludes, skip_dev_artifacts)
+            {
+                ui.toast(Tone::Success, "Backup rules saved");
+                close = true;
+            }
+            if ui.button("Cancel").clicked {
+                close = true;
+            }
+        });
+    });
+    if !close && !response.close_requested {
+        app.folder_rules = Some(draft);
+    }
+}
+
 // ---------------------------------------------------------------- Storage
+
+fn encryption_page(ui: &mut Ui, app: &mut App) {
+    page_header(ui, "Encryption", "Protect backup contents on this device before uploading.");
+    let required = app.dashboard.encryption_required();
+    ui.card(|ui| local_encryption_controls(ui, &mut app.draft, required));
+    let mut candidate = app.cfg.clone();
+    app.draft.apply_local_encryption(&mut candidate);
+    if ui.button_ex("Save encryption settings", ButtonKind::Primary, Some(Icon::Check), candidate != app.cfg).clicked {
+        if required || candidate.s3.client_encryption {
+            if let Err(error) = crate::file_crypto::validate_key(&candidate.s3.recovery_key) {
+                ui.toast(Tone::Danger, &error);
+                return;
+            }
+        }
+        let previous = std::mem::replace(&mut app.cfg, candidate);
+        if app.save(ui) {
+            app.refresh_folder_sizes();
+            ui.toast(Tone::Success, "Encryption settings saved");
+        } else {
+            app.cfg = previous;
+        }
+    }
+}
+
+fn local_encryption_controls(ui: &mut Ui, d: &mut Draft, required: bool) {
+    if required {
+        ui.callout(Tone::Info, "Your dashboard requires files to be encrypted before upload.");
+    } else {
+        ui.checkbox(&mut d.client_encryption, "Encrypt file contents before uploading");
+    }
+    if required || d.client_encryption || !d.recovery_key.is_empty() {
+        ui.field_label("Recovery key (64 hexadecimal characters)");
+        ui.text_input("recovery-key", &mut d.recovery_key, &TextInputOptions { password: !d.show_recovery_key, placeholder: "Generate a key or paste your existing key", ..Default::default() });
+        ui.checkbox(&mut d.show_recovery_key, "Show recovery key");
+        ui.horizontal(|ui| {
+            if ui.button_ex("Generate key", ButtonKind::Secondary, Some(Icon::Key), d.recovery_key.is_empty()).clicked {
+                match crate::file_crypto::generate_key() { Ok(key) => d.recovery_key = key, Err(e) => ui.toast(Tone::Danger, &e) }
+            }
+            if ui.button_ex("Copy recovery key", ButtonKind::Secondary, None, !d.recovery_key.is_empty()).clicked {
+                ui.copy_to_clipboard(&d.recovery_key); ui.toast(Tone::Info, "Recovery key copied. Save it somewhere safe outside this computer.");
+            }
+        });
+        ui.callout(Tone::Warning, "Keep a separate copy of your recovery key. Losing it makes encrypted backups unrecoverable. File names remain visible. Keep older keys if you change keys; paste the matching key here before restoring older files.");
+        ui.small("Recovery keys are saved with your settings for scheduled backups. Linux uses a private configuration file, without OS encryption.");
+    }
+    ui.small("Changing encryption settings re-uploads files on the next backup. Existing objects are updated only as uploads succeed.");
+}
 
 fn storage_page(ui: &mut Ui, app: &mut App) {
     page_header(ui, "Storage", "The S3 bucket your backups are stored in.");
@@ -1176,23 +1512,7 @@ fn storage_page(ui: &mut Ui, app: &mut App) {
             ui.field_label("KMS key ID or ARN (optional: provider default when empty)");
             ui.text_input("kms-key", &mut d.kms_key_id, &TextInputOptions::default());
         }
-        ui.checkbox(&mut d.client_encryption, "Encrypt file contents before uploading");
-        if d.client_encryption || !d.recovery_key.is_empty() {
-            ui.field_label("Recovery key (64 hexadecimal characters)");
-            ui.text_input("recovery-key", &mut d.recovery_key, &TextInputOptions { password: !d.show_recovery_key, placeholder: "Generate a key or paste your existing key", ..Default::default() });
-            ui.checkbox(&mut d.show_recovery_key, "Show recovery key");
-            ui.horizontal(|ui| {
-                if ui.button_ex("Generate key", ButtonKind::Secondary, Some(Icon::Key), d.recovery_key.is_empty()).clicked {
-                    match crate::file_crypto::generate_key() { Ok(key) => d.recovery_key = key, Err(e) => ui.toast(Tone::Danger, &e) }
-                }
-                if ui.button_ex("Copy recovery key", ButtonKind::Secondary, None, !d.recovery_key.is_empty()).clicked {
-                    ui.copy_to_clipboard(&d.recovery_key); ui.toast(Tone::Info, "Recovery key copied. Save it somewhere safe outside this computer.");
-                }
-            });
-            ui.callout(Tone::Warning, "Keep a separate copy of your recovery key. Losing it makes encrypted backups unrecoverable. File names remain visible. Keep older keys if you change keys; paste the matching key here before restoring older files.");
-            ui.small("Recovery keys are saved with your settings for scheduled backups. Linux uses a private configuration file, without OS encryption.");
-        }
-        ui.small("Changing encryption settings re-uploads files on the next backup. Existing objects are updated only as uploads succeed.");
+        local_encryption_controls(ui, d, false);
         if ui.link(if d.show_advanced { "Hide advanced options" } else { "Advanced options" }).clicked {
             d.show_advanced = !d.show_advanced;
         }
@@ -1229,6 +1549,7 @@ fn storage_page(ui: &mut Ui, app: &mut App) {
                 return;
             }
             app.cfg = candidate.clone();
+            app.refresh_folder_sizes();
             if app.save(ui) {
                 ui.toast(Tone::Success, "Storage settings saved");
                 let s3 = app.cfg.s3.clone();
@@ -1329,7 +1650,7 @@ fn schedule_page(ui: &mut Ui, app: &mut App) {
         ui.space(4.0);
         ui.field_label("Files uploaded at the same time");
         ui.number_stepper("parallel", &mut app.parallel, 1, 16, 1, "");
-        ui.small("More is faster on fast connections; fewer is gentler on slow ones.");
+        ui.small("Large-file parts share this upload connection limit.");
         ui.space(6.0);
         let busy = app.sched_job.is_some();
         if ui
@@ -1460,6 +1781,74 @@ fn history_page(ui: &mut Ui, app: &mut App) {
 }
 
 #[cfg(test)]
+mod folder_settings_tests {
+    use super::*;
+
+    #[test]
+    fn failed_folder_settings_save_keeps_active_settings_and_estimates() {
+        // BACKUP_TAKER_HOME is process-wide and other tests also use it.
+        const CHILD: &str = "BT_TEST_FOLDER_SETTINGS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = std::env::temp_dir().join(format!("bt-folder-settings-{}-{}", std::process::id(), now_secs()));
+            std::fs::create_dir(&dir).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "app_ui::folder_settings_tests::failed_folder_settings_save_keeps_active_settings_and_estimates"])
+                .env(CHILD, "1")
+                .env("BACKUP_TAKER_HOME", &dir)
+                .output().unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
+
+        let mut app = App::new();
+        let mut ui = Ui::new(Theme::light());
+        let dir = crate::paths::app_dir();
+        let original = dir.join("existing");
+        std::fs::create_dir(&original).unwrap();
+        assert!(app.cfg.add_folder(original.to_str().unwrap()));
+        let other = dir.join("other");
+        assert!(app.cfg.add_folder(other.to_str().unwrap()));
+        app.cfg.save().unwrap();
+        let saved = app.cfg.clone();
+        let path = saved.folders[0].path.clone();
+        let other_path = saved.folders[1].path.clone();
+        for folder in &saved.folders {
+            app.folder_sizes.insert(folder.path.clone(), Progress::default());
+        }
+        let shared = Shared::new();
+        let result = Arc::new(Mutex::new(None));
+        app.folder_scan = Some(FolderScan {
+            path: path.clone(),
+            shared: shared.clone(),
+            result: result.clone(),
+        });
+
+        // A directory in place of the temporary config file prevents an atomic save.
+        let temp_config = dir.join("config.tmp");
+        std::fs::create_dir(&temp_config).unwrap();
+        add_folder(&mut ui, &mut app, dir);
+        assert!(!app.save_folder_rules(&mut ui, 0, vec!["*.bak".into()], Some(false)));
+        assert_eq!(app.cfg, saved);
+        assert_eq!(Config::load(), saved);
+        assert!(app.folder_sizes.contains_key(&path));
+        assert!(!shared.cancel.load(Ordering::Relaxed));
+
+        std::fs::remove_dir(temp_config).unwrap();
+        assert!(app.save_folder_rules(&mut ui, 0, vec!["*.bak".into()], Some(false)));
+        let reloaded = Config::load();
+        assert_eq!(reloaded.folders[0].excludes, ["*.bak"]);
+        assert_eq!(reloaded.folders[0].skip_dev_artifacts, Some(false));
+        assert!(!app.folder_sizes.contains_key(&path));
+        assert!(app.folder_sizes.contains_key(&other_path));
+        assert!(shared.cancel.load(Ordering::Relaxed));
+        *result.lock().unwrap() = Some((Progress::default(), Arc::new(UploadIndex::for_preview(&saved))));
+        app.poll_folder_scan(&mut ui);
+        assert!(!app.folder_sizes.contains_key(&path));
+    }
+}
+
+#[cfg(test)]
 mod encryption_ui_tests {
     use super::*;
     #[test]
@@ -1475,4 +1864,40 @@ mod encryption_ui_tests {
             assert!(cfg.s3.kms_key_id.is_empty());
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn managed_encryption_save_preserves_saved_standalone_destination() {
+    let mut cfg = Config::default();
+    cfg.s3.bucket = "standalone-bucket".into();
+    cfg.s3.access_key = "standalone-key".into();
+    cfg.s3.server_encryption = "AES256".into();
+    let mut draft = Draft::from(&cfg);
+    draft.bucket = "unsaved-bucket".into();
+    draft.access_key = "unsaved-key".into();
+    draft.server_encryption = 2;
+    draft.client_encryption = true;
+    draft.recovery_key = "ab".repeat(32);
+    draft.apply_local_encryption(&mut cfg);
+    assert_eq!(cfg.s3.bucket, "standalone-bucket");
+    assert_eq!(cfg.s3.access_key, "standalone-key");
+    assert_eq!(cfg.s3.server_encryption, "AES256");
+    assert!(cfg.s3.client_encryption);
+    assert_eq!(cfg.s3.recovery_key, "ab".repeat(32));
+}
+
+
+#[cfg(test)]
+#[test]
+fn stop_and_quit_waits_for_backup_to_finish_saving() {
+    let mut app = App::new();
+    app.backup_job = Some(Arc::new(Mutex::new(None)));
+    app.confirm_quit = true;
+    app.stop_before_quit();
+    assert!(app.shared.cancel.load(Ordering::SeqCst));
+    assert!(!app.confirm_quit);
+    assert!(!app.ready_to_quit());
+    app.backup_job = None;
+    assert!(app.ready_to_quit());
 }

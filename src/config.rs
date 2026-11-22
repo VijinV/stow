@@ -24,11 +24,13 @@ pub struct S3Settings {
     pub recovery_key: String,
     pub server_encryption: String,
     pub kms_key_id: String,
+    /// Resolved only in memory for a dashboard-managed destination.
+    pub(crate) managed: Option<crate::managed::Target>,
 }
 
 impl S3Settings {
     pub fn is_complete(&self) -> bool {
-        !self.bucket.trim().is_empty() && !self.access_key.trim().is_empty() && !self.secret_key.is_empty()
+        !self.bucket.trim().is_empty() && (self.managed.is_some() || (!self.access_key.trim().is_empty() && !self.secret_key.is_empty()))
     }
 }
 
@@ -38,6 +40,9 @@ pub struct Folder {
     /// Folder name used in the bucket (unique among folders).
     pub label: String,
     pub enabled: bool,
+    pub excludes: Vec<String>,
+    /// None inherits the global developer-artifact setting.
+    pub skip_dev_artifacts: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +60,7 @@ pub struct Config {
     pub folders: Vec<Folder>,
     pub excludes: Vec<String>,
     pub skip_hidden: bool,
+    pub skip_dev_artifacts: bool,
     pub parallel_uploads: u32,
     pub device_name: String,
     pub schedule: ScheduleMode,
@@ -63,6 +69,7 @@ pub struct Config {
 }
 
 pub const DEFAULT_EXCLUDES: &[&str] = &[".DS_Store", "Thumbs.db", "desktop.ini", "~$*", "*.tmp", "*.swp", ".Trash*", "$RECYCLE.BIN"];
+pub const DEV_ARTIFACT_DIRS: &[&str] = &["node_modules", "build", "dist", "target", ".next"];
 
 impl Default for Config {
     fn default() -> Self {
@@ -71,6 +78,7 @@ impl Default for Config {
             folders: Vec::new(),
             excludes: DEFAULT_EXCLUDES.iter().map(|s| s.to_string()).collect(),
             skip_hidden: false,
+            skip_dev_artifacts: false,
             parallel_uploads: 4,
             device_name: sanitize_label(&paths::hostname()),
             schedule: ScheduleMode::Off,
@@ -124,6 +132,7 @@ impl Config {
             recovery_key: secret::unprotect(&s3.str_or("recovery_key", "")),
             server_encryption: s3.str_or("server_encryption", ""),
             kms_key_id: s3.str_or("kms_key_id", ""),
+            managed: None,
         };
         let folders = j
             .arr("folders")
@@ -133,7 +142,16 @@ impl Config {
                 if path.is_empty() {
                     return None;
                 }
-                Some(Folder { label: f.str_or("label", &label_for(&path)), path, enabled: f.bool_or("enabled", true) })
+                Some(Folder {
+                    label: f.str_or("label", &label_for(&path)),
+                    path,
+                    enabled: f.bool_or("enabled", true),
+                    excludes: f.arr("excludes").iter().filter_map(Json::as_str).map(String::from).collect(),
+                    skip_dev_artifacts: match f.get("skip_dev_artifacts") {
+                        Some(Json::Bool(value)) => Some(*value),
+                        _ => None,
+                    },
+                })
             })
             .collect();
         let excludes = match j.get("excludes") {
@@ -145,6 +163,7 @@ impl Config {
             folders,
             excludes,
             skip_hidden: j.bool_or("skip_hidden", d.skip_hidden),
+            skip_dev_artifacts: j.bool_or("skip_dev_artifacts", d.skip_dev_artifacts),
             parallel_uploads: (j.num_or("parallel_uploads", 4.0) as u32).clamp(1, 16),
             device_name: { let n = j.str_or("device_name", ""); if n.is_empty() { d.device_name } else { n } },
             schedule: match j.str_or("schedule", "off").as_str() {
@@ -185,6 +204,12 @@ impl Config {
                         o.set("path", f.path.as_str());
                         o.set("label", f.label.as_str());
                         o.set("enabled", f.enabled);
+                        if !f.excludes.is_empty() {
+                            o.set("excludes", Json::Arr(f.excludes.iter().map(|s| Json::from(s.as_str())).collect()));
+                        }
+                        if let Some(skip) = f.skip_dev_artifacts {
+                            o.set("skip_dev_artifacts", skip);
+                        }
                         o
                     })
                     .collect(),
@@ -192,6 +217,7 @@ impl Config {
         );
         j.set("excludes", Json::Arr(self.excludes.iter().map(|s| Json::from(s.as_str())).collect()));
         j.set("skip_hidden", self.skip_hidden);
+        j.set("skip_dev_artifacts", self.skip_dev_artifacts);
         j.set("parallel_uploads", self.parallel_uploads);
         j.set("device_name", self.device_name.as_str());
         j.set(
@@ -221,12 +247,21 @@ impl Config {
             label = format!("{} ({})", base, n);
             n += 1;
         }
-        self.folders.push(Folder { path: norm.to_string(), label, enabled: true });
+        self.folders.push(Folder {
+            path: norm.to_string(),
+            label,
+            enabled: true,
+            excludes: Vec::new(),
+            skip_dev_artifacts: None,
+        });
         true
     }
 
     /// Remote key prefix for one folder: "<prefix>/<device>/<label>/".
     pub fn remote_root(&self, f: &Folder) -> String {
+        if self.s3.managed.is_some() {
+            return format!("{}{}/", self.s3.prefix, f.label);
+        }
         let mut parts = Vec::new();
         let p = self.s3.prefix.trim().trim_matches('/');
         if !p.is_empty() {
@@ -263,6 +298,31 @@ pub fn label_for(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn folder_rules_round_trip_with_legacy_defaults() {
+        let json = Json::parse(r#"{
+            "skip_dev_artifacts": true,
+            "folders": [
+                {"path": "legacy"},
+                {"path": "include", "excludes": ["*.bak", "cache/**"], "skip_dev_artifacts": false},
+                {"path": "exclude", "skip_dev_artifacts": true}
+            ]
+        }"#).unwrap();
+        let mut cfg = Config::from_json(&json);
+        assert!(cfg.add_folder("new"));
+        let saved = Json::parse(&cfg.to_json().to_string_pretty()).unwrap();
+        let folders = saved.arr("folders");
+        for i in [0, 3] {
+            assert!(folders[i].arr("excludes").is_empty());
+            assert_eq!(folders[i].get("skip_dev_artifacts"), None);
+        }
+        assert_eq!(folders[1].arr("excludes"), &[Json::from("*.bak"), Json::from("cache/**")]);
+        assert_eq!(folders[1].get("skip_dev_artifacts"), Some(&Json::Bool(false)));
+        assert_eq!(folders[2].get("skip_dev_artifacts"), Some(&Json::Bool(true)));
+        assert_eq!(Config::from_json(&saved), cfg);
+    }
+
     #[test]
     fn json_roundtrip_and_labels() {
         std::env::set_var("BACKUP_TAKER_PLAIN_SECRETS", "1");

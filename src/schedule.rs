@@ -52,6 +52,25 @@ fn interval(cfg: &Config) -> u32 {
     *INTERVAL_CHOICES.iter().find(|&&c| c >= h).unwrap_or(&24)
 }
 
+/// Estimate the next configured wall-clock occurrence for dashboard status.
+#[cfg(unix)]
+pub(crate) fn next_expected(cfg: &Config, now: i64) -> Option<u64> {
+    if cfg.schedule == ScheduleMode::Off { return None; }
+    let daily = cfg.daily_minutes();
+    let interval_minutes = i64::from(interval(cfg)) * 60;
+    let first = now.div_euclid(60) + 1;
+    (first..first + 27 * 60).find_map(|minute| {
+        let utc = minute * 60;
+        let local_minutes = (utc + crate::timefmt::local_offset_secs(utc)).div_euclid(60).rem_euclid(24 * 60);
+        let matches = match cfg.schedule {
+            ScheduleMode::Daily => daily.is_some_and(|m| i64::from(m) == local_minutes),
+            ScheduleMode::Interval => local_minutes.rem_euclid(interval_minutes) == 0,
+            ScheduleMode::Off => false,
+        };
+        matches.then_some(utc as u64)
+    })
+}
+
 /// Install, update or remove the OS schedule to match `cfg`. Returns a human status message.
 pub fn apply(cfg: &Config) -> Result<String, String> {
     if cfg.schedule == ScheduleMode::Daily && cfg.daily_minutes().is_none() {

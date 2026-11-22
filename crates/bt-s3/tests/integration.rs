@@ -270,6 +270,47 @@ fn cancel_mid_upload() {
 
 #[test]
 #[ignore]
+fn resumable_parallel_multipart_roundtrip() {
+    for ep in endpoints() {
+        let c = bucket(&ep, "resume");
+        let d = tmpdir();
+        let source = d.join("source");
+        let size = (20 << 20) + 1234;
+        make_file(&source, size);
+        let checkpoint = d.join("multipart");
+        let opts = UploadOptions {
+            part_size: 5 << 20,
+            multipart_threshold: 5 << 20,
+            multipart_parallelism: 3,
+            multipart_checkpoint: Some(checkpoint.clone()),
+            ..Default::default()
+        };
+        let cancel = AtomicBool::new(false);
+        let r = c.upload_file("object", &source, &opts, &mut |_| {
+            cancel.store(true, Ordering::Relaxed);
+        }, &cancel);
+        assert!(r.unwrap_err().is_cancelled(), "{ep}");
+        assert!(checkpoint.is_file());
+        assert_eq!(c.list_multipart_uploads("").unwrap().len(), 1, "{ep}");
+        assert!(c.head_object("object").unwrap().is_none());
+
+        let restarted = S3Client::new(c.config().clone(), Arc::new(NoTls));
+        let mut sent = 0;
+        restarted.upload_file("object", &source, &opts, &mut |n| sent += n, &AtomicBool::new(false)).unwrap();
+        assert_eq!(sent, size);
+        assert!(!checkpoint.exists());
+        assert!(restarted.list_multipart_uploads("").unwrap().is_empty());
+        let downloaded = d.join("downloaded");
+        restarted.get_object_to_file("object", &downloaded, &mut |_| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(file_sha(&source), file_sha(&downloaded), "{ep}");
+        println!("{ep}: cancelled, resumed and verified {size} bytes");
+        cleanup(&restarted);
+        std::fs::remove_dir_all(d).unwrap();
+    }
+}
+
+#[test]
+#[ignore]
 fn parallel_uploads() {
     for ep in endpoints() {
         let c = Arc::new(bucket(&ep, "par"));

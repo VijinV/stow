@@ -1,0 +1,27 @@
+[workspace]
+
+[package]
+name = "stow-dashboard"
+version = "0.3.0"
+edition = "2021"
+publish = false
+
+[features]
+default = ["aws"]
+aws = ["dep:aws-config", "dep:aws-sdk-sts"]
+
+[dependencies]
+axum = "0.8"
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "default-https-client"], optional = true }
+aws-sdk-sts = { version = "1", optional = true }
+rusqlite = { version = "0.39", features = ["bundled", "uuid"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+tower-http = { version = "0.6", features = ["fs"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

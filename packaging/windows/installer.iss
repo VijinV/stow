@@ -1,7 +1,7 @@
 ; Inno Setup script -> dist\Stow-<version>-windows-x64-setup.exe
-; Build: iscc /DVersion=0.2.1 packaging\windows\installer.iss
+; Build: iscc /DVersion=0.3.0 packaging\windows\installer.iss
 #ifndef Version
-  #define Version "0.2.1"
+  #define Version "0.3.0"
 #endif
 [Setup]
 AppId={{6C1C9C5E-3B57-4C2B-9E7E-6A1B5E0D2F41}

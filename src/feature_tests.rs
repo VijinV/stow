@@ -53,6 +53,18 @@ fn encrypted_backup_browse_restore_end_to_end() {
         assert_eq!(p.files_skipped, 3);
         let p = backup(&cfg, true);
         assert_eq!(p.files_uploaded, 3);
+        let verification = crate::verify::run(&cfg, &Shared::new()).unwrap();
+        assert!(verification.errors.is_empty(), "{:?}", verification.errors);
+        let verified = verification.reports;
+        assert_eq!(verified.len(), 1);
+        assert_eq!(verified[0].1.matched, 3);
+        assert!(!verified[0].1.has_issues());
+        let saved = crate::verify::latest(&cfg, &cfg.folders[0]).unwrap();
+        assert_eq!(saved.matched, 3);
+        assert!(saved.checked_at > 0);
+        let mut different_rules = cfg.clone();
+        different_rules.folders[0].excludes.push("*.bin".into());
+        assert!(crate::verify::latest(&different_rules, &different_rules.folders[0]).is_none());
         let objects = browse::inventory(&cfg.s3).unwrap();
         assert_eq!(objects.len(), 3);
         assert!(objects.iter().map(|o| o.size).sum::<u64>() > big.len() as u64);
@@ -103,8 +115,21 @@ fn encrypted_backup_browse_restore_end_to_end() {
         )
         .is_err());
         assert!(!root.join("wrong/note.txt").exists());
+        client.put_object_bytes(&note_key, b"replacement", None).unwrap();
+        let empty_key = format!("{prefix}sub/empty.txt");
+        client.delete_object(&empty_key).unwrap();
+        fs::create_dir_all(root.join("source")).unwrap();
+        fs::write(root.join("source/pending.txt"), b"not uploaded").unwrap();
+        let verification = crate::verify::run(&cfg, &Shared::new()).unwrap();
+        assert!(verification.errors.is_empty(), "{:?}", verification.errors);
+        let verified = verification.reports;
+        let report = &verified[0].1;
+        assert_eq!((report.matched, report.mismatched, report.missing, report.pending), (1, 1, 1, 1));
+        assert!(report.has_issues());
         for o in objects {
-            client.delete_object(&o.key).unwrap();
+            if o.key != empty_key {
+                client.delete_object(&o.key).unwrap();
+            }
         }
         client.delete_bucket().unwrap();
         fs::remove_dir_all(root).unwrap();

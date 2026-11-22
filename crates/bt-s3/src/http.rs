@@ -1,14 +1,33 @@
 //! Minimal HTTP/1.1 client with keep-alive connection pooling.
+use std::any::Any;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// A bidirectional byte stream (plain TCP or TLS).
-pub trait Stream: Read + Write + Send {}
-impl<T: Read + Write + Send> Stream for T {}
+pub trait Stream: Read + Write + Send {
+    #[doc(hidden)]
+    fn backing_socket(&self) -> Option<&TcpStream>
+    where
+        Self: 'static;
+}
+
+impl<T: Read + Write + Send> Stream for T {
+    fn backing_socket(&self) -> Option<&TcpStream>
+    where
+        Self: 'static,
+    {
+        // Keep accepting arbitrary stream types while recognizing Stow's
+        // native transports, which expose a socket we can shut down.
+        let stream: &dyn Any = self;
+        stream
+            .downcast_ref::<TcpStream>()
+            .or_else(|| stream.downcast_ref::<bt_tls::TlsStream>().map(bt_tls::TlsStream::get_ref))
+    }
+}
 
 /// Pluggable TLS: connect to `host:port` and return an encrypted stream.
 pub trait TlsConnector: Send + Sync {
@@ -127,6 +146,15 @@ pub struct Request<'a> {
     pub cancel: Option<&'a AtomicBool>,
 }
 
+impl Request<'_> {
+    fn response_cancel(&self) -> Option<&AtomicBool> {
+        match self.method {
+            "GET" | "HEAD" if self.body.is_none() => self.cancel,
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Response {
     pub status: u16,
@@ -154,18 +182,35 @@ struct Conn {
 }
 
 const MAX_LINE: usize = 64 * 1024;
+const CANCEL_POLL: Duration = Duration::from_millis(50);
+
+fn cancelled() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "cancelled")
+}
+
+fn check_cancel(cancel: Option<&AtomicBool>) -> io::Result<()> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(cancelled());
+    }
+    Ok(())
+}
 
 impl Conn {
     fn new(stream: Box<dyn Stream>) -> Conn {
         Conn { stream, buf: vec![0u8; 64 * 1024].into_boxed_slice(), pos: 0, len: 0, idle_since: Instant::now() }
     }
 
-    fn fill(&mut self) -> io::Result<usize> {
+    fn fill(&mut self, cancel: Option<&AtomicBool>) -> io::Result<usize> {
+        check_cancel(cancel)?;
         if self.pos == self.len {
             self.pos = 0;
             self.len = 0;
             loop {
-                match self.stream.read(&mut self.buf) {
+                let result = self.stream.read(&mut self.buf);
+                // Cancellation can make the read report EOF or another socket
+                // error. Check before accepting data or handling either result.
+                check_cancel(cancel)?;
+                match result {
                     Ok(n) => {
                         self.len = n;
                         break;
@@ -178,10 +223,10 @@ impl Conn {
         Ok(self.len - self.pos)
     }
 
-    fn read_line(&mut self) -> io::Result<String> {
+    fn read_line(&mut self, cancel: Option<&AtomicBool>) -> io::Result<String> {
         let mut line = Vec::new();
         loop {
-            if self.fill()? == 0 {
+            if self.fill(cancel)? == 0 {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "connection closed by server"));
             }
             let avail = &self.buf[self.pos..self.len];
@@ -202,9 +247,9 @@ impl Conn {
         String::from_utf8(line).map_err(|_| bad("non-UTF-8 HTTP header"))
     }
 
-    fn read_exact_to(&mut self, mut n: u64, out: &mut dyn FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+    fn read_exact_to(&mut self, mut n: u64, out: &mut dyn FnMut(&[u8]) -> io::Result<()>, cancel: Option<&AtomicBool>) -> io::Result<()> {
         while n > 0 {
-            if self.fill()? == 0 {
+            if self.fill(cancel)? == 0 {
                 return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "response body truncated"));
             }
             let take = ((self.len - self.pos) as u64).min(n) as usize;
@@ -215,9 +260,9 @@ impl Conn {
         Ok(())
     }
 
-    fn read_to_eof(&mut self, out: &mut dyn FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+    fn read_to_eof(&mut self, out: &mut dyn FnMut(&[u8]) -> io::Result<()>, cancel: Option<&AtomicBool>) -> io::Result<()> {
         loop {
-            match self.fill() {
+            match self.fill(cancel) {
                 Ok(0) => return Ok(()),
                 Ok(_) => {
                     out(&self.buf[self.pos..self.len])?;
@@ -241,6 +286,7 @@ pub struct HttpClient {
     pub connect_timeout: Duration,
     pub io_timeout: Duration,
     pub user_agent: String,
+    pub max_response_bytes: usize,
 }
 
 const POOL_PER_HOST: usize = 16;
@@ -253,6 +299,7 @@ impl HttpClient {
             pool: Mutex::new(HashMap::new()),
             connect_timeout: Duration::from_secs(15),
             io_timeout: Duration::from_secs(90),
+            max_response_bytes: 64 * 1024 * 1024,
             user_agent: concat!("backup-taker/", env!("CARGO_PKG_VERSION")).to_string(),
         }
     }
@@ -310,10 +357,14 @@ impl HttpClient {
     /// otherwise (or for non-2xx) it is collected in `Response::body`.
     /// `progress` receives byte deltas of the uploaded body and the downloaded
     /// sink data. A pooled connection that turns out to be stale is retried once.
+    /// Native TCP and TLS exchanges with a cancel flag can be interrupted
+    /// while waiting for a peer to receive data or acknowledge a request.
     pub fn send(&self, req: &Request, mut sink: Option<&mut dyn Write>, progress: &mut dyn FnMut(u64)) -> io::Result<Response> {
         let key = Self::pool_key(req.url);
+        let response_cancel = req.response_cancel();
         let mut attempt = 0;
         loop {
+            check_cancel(req.cancel)?;
             attempt += 1;
             let (mut conn, reused) = match self.take_pooled(&key) {
                 Some(c) => (c, true),
@@ -324,7 +375,9 @@ impl HttpClient {
                 Some(ref mut s) => Some(&mut **s),
                 None => None,
             };
-            match self.exchange(&mut conn, req, s, progress, &mut got_response) {
+            let result = self.exchange(&mut conn, req, s, progress, &mut got_response);
+            check_cancel(response_cancel)?;
+            match result {
                 Ok((resp, reusable)) => {
                     if reusable {
                         self.put_back(key, conn);
@@ -332,6 +385,9 @@ impl HttpClient {
                     return Ok(resp);
                 }
                 Err(e) => {
+                    if req.cancel.is_some() && e.kind() == io::ErrorKind::Interrupted {
+                        return Err(e);
+                    }
                     let cancelled = req.cancel.map(|c| c.load(Ordering::Relaxed)).unwrap_or(false);
                     if reused && !got_response && !cancelled && attempt < 3 {
                         continue;
@@ -343,6 +399,45 @@ impl HttpClient {
     }
 
     fn exchange(
+        &self,
+        conn: &mut Conn,
+        req: &Request,
+        sink: Option<&mut dyn Write>,
+        progress: &mut dyn FnMut(u64),
+        got_response: &mut bool,
+    ) -> io::Result<(Response, bool)> {
+        check_cancel(req.cancel)?;
+        let socket = req.cancel.and_then(|_| conn.stream.as_ref().backing_socket());
+        let Some((cancel, socket)) = req.cancel.zip(socket) else {
+            return self.exchange_request(conn, req, sink, progress, got_response);
+        };
+        let socket = socket.try_clone()?;
+        std::thread::scope(|scope| {
+            let (done, wait) = mpsc::channel::<()>();
+            let watcher = std::thread::Builder::new().spawn_scoped(scope, move || {
+                while !cancel.load(Ordering::Relaxed) {
+                    if wait.recv_timeout(CANCEL_POLL) != Err(mpsc::RecvTimeoutError::Timeout) {
+                        return false;
+                    }
+                }
+                let _ = socket.shutdown(Shutdown::Both);
+                true
+            })?;
+            let result = self.exchange_request(conn, req, sink, progress, got_response);
+            // Keep a completed write acknowledgement if it arrived before
+            // shutdown, but never put an interrupted connection back in the pool.
+            drop(done);
+            if watcher.join().unwrap() {
+                return match result {
+                    Ok((response, _)) if req.response_cancel().is_none() => Ok((response, false)),
+                    _ => Err(cancelled()),
+                };
+            }
+            result
+        })
+    }
+
+    fn exchange_request(
         &self,
         conn: &mut Conn,
         req: &Request,
@@ -420,8 +515,20 @@ impl HttpClient {
         progress: &mut dyn FnMut(u64),
         got_response: &mut bool,
     ) -> io::Result<(Response, bool)> {
+        self.parse_response(conn, req, sink, progress, got_response, req.response_cancel())
+    }
+
+    fn parse_response(
+        &self,
+        conn: &mut Conn,
+        req: &Request,
+        sink: Option<&mut dyn Write>,
+        progress: &mut dyn FnMut(u64),
+        got_response: &mut bool,
+        cancel: Option<&AtomicBool>,
+    ) -> io::Result<(Response, bool)> {
         let (resp_line, headers) = loop {
-            let line = conn.read_line()?;
+            let line = conn.read_line(cancel)?;
             *got_response = true;
             let mut parts = line.splitn(3, ' ');
             let version = parts.next().unwrap_or("");
@@ -432,7 +539,7 @@ impl HttpClient {
             let reason = parts.next().unwrap_or("").to_string();
             let mut headers = Vec::new();
             loop {
-                let l = conn.read_line()?;
+                let l = conn.read_line(cancel)?;
                 if l.is_empty() {
                     break;
                 }
@@ -465,7 +572,7 @@ impl HttpClient {
                         progress(d.len() as u64);
                     }
                 } else {
-                    if body.len() + d.len() > 64 * 1024 * 1024 {
+                    if body.len() + d.len() > self.max_response_bytes {
                         return Err(bad("response body too large"));
                     }
                     body.extend_from_slice(d);
@@ -475,24 +582,24 @@ impl HttpClient {
             let te = resp.header("transfer-encoding").unwrap_or("").to_ascii_lowercase();
             if te.contains("chunked") {
                 loop {
-                    let line = conn.read_line()?;
+                    let line = conn.read_line(cancel)?;
                     let size_str = line.split(';').next().unwrap_or("").trim();
                     let size = u64::from_str_radix(size_str, 16).map_err(|_| bad("bad chunk size"))?;
                     if size == 0 {
                         // trailers
-                        while !conn.read_line()?.is_empty() {}
+                        while !conn.read_line(cancel)?.is_empty() {}
                         break;
                     }
-                    conn.read_exact_to(size, &mut out)?;
-                    if !conn.read_line()?.is_empty() {
+                    conn.read_exact_to(size, &mut out, cancel)?;
+                    if !conn.read_line(cancel)?.is_empty() {
                         return Err(bad("missing CRLF after chunk"));
                     }
                 }
             } else if let Some(cl) = resp.header("content-length") {
                 let n: u64 = cl.trim().parse().map_err(|_| bad("bad Content-Length"))?;
-                conn.read_exact_to(n, &mut out)?;
+                conn.read_exact_to(n, &mut out, cancel)?;
             } else {
-                conn.read_to_eof(&mut out)?;
+                conn.read_to_eof(&mut out, cancel)?;
                 reusable = false;
             }
             resp.body = body;
@@ -572,6 +679,108 @@ mod tests {
     }
 
     #[test]
+    fn cancel_stalled_response_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let mut client = HttpClient::new(Arc::new(NoTls));
+        client.io_timeout = Duration::from_secs(3);
+        let cancel = AtomicBool::new(false);
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello")
+                    .unwrap();
+                // Leave the response incomplete until the client closes the connection.
+                socket.read(&mut [0])
+            });
+            let flag = &cancel;
+            let stop = scope.spawn(move || {
+                progress_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                // Let the reader enter the next socket read before requesting Stop.
+                std::thread::sleep(Duration::from_millis(50));
+                flag.store(true, Ordering::Relaxed);
+            });
+            let req = Request { method: "GET", url: &url, headers: &[], body: None, cancel: Some(&cancel) };
+            let mut sink = Vec::new();
+            let mut bytes = 0;
+            let start = Instant::now();
+            let error = client
+                .send(&req, Some(&mut sink), &mut |n| {
+                    bytes += n;
+                    if bytes == 5 {
+                        progress_tx.send(()).unwrap();
+                    }
+                })
+                .unwrap_err();
+            let elapsed = start.elapsed();
+            stop.join().unwrap();
+            assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+            assert!(elapsed < Duration::from_secs(1), "cancellation took {elapsed:?}");
+            assert_eq!(sink, b"hello");
+            match server.join().unwrap() {
+                Ok(0) => {}
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
+                other => panic!("expected the cancelled socket to close, got {other:?}"),
+            }
+            assert!(client.take_pooled(&HttpClient::pool_key(&url)).is_none());
+        });
+    }
+
+    #[test]
+    fn stop_interrupts_upload_waiting_for_storage_acknowledgement() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
+        let mut client = HttpClient::new(Arc::new(NoTls));
+        client.io_timeout = Duration::from_secs(3);
+        let cancel = AtomicBool::new(false);
+        let (received, body_at_server) = mpsc::channel();
+        let body = B(b"payload".to_vec());
+
+        std::thread::scope(|scope| {
+            let server = scope.spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).unwrap();
+                    request.push(byte[0]);
+                }
+                let mut body = [0; 7];
+                socket.read_exact(&mut body).unwrap();
+                assert_eq!(&body, b"payload");
+                received.send(()).unwrap();
+                // Withhold the S3 acknowledgement until the connection closes.
+                let _ = socket.read(&mut [0]);
+            });
+            let flag = &cancel;
+            let stop = scope.spawn(move || {
+                body_at_server.recv_timeout(Duration::from_secs(2)).unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+                flag.store(true, Ordering::Relaxed);
+            });
+            let request = Request { method: "PUT", url: &url, headers: &[], body: Some(&body), cancel: Some(&cancel) };
+            let start = Instant::now();
+            let result = client.send(&request, None, &mut |_| {}).unwrap_err();
+            stop.join().unwrap();
+            server.join().unwrap();
+            assert_eq!(result.kind(), io::ErrorKind::Interrupted);
+            assert!(start.elapsed() < Duration::from_secs(1));
+            assert!(client.take_pooled(&HttpClient::pool_key(&url)).is_none());
+        });
+    }
+
+    #[test]
     fn chunked_keepalive_and_sink() {
         let (port, h) = serve(vec![
             b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;ext=1\r\nhello\r\n6\r\n world\r\n0\r\nX-Trailer: y\r\n\r\n".to_vec(),
@@ -599,6 +808,33 @@ mod tests {
         let reqs = h.join().unwrap();
         assert!(reqs[0].starts_with("GET /a%20b?x=1 HTTP/1.1\r\nHost: 127.0.0.1:"));
         assert!(reqs[1].contains("Content-Length: 7\r\n") && reqs[1].ends_with("payload"));
+    }
+
+    #[test]
+    fn streams_and_reuses_cancellable_connection() {
+        let (port, server) = serve(vec![
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+        ]);
+        let mut client = HttpClient::new(Arc::new(NoTls));
+        client.io_timeout = Duration::from_secs(3);
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let cancel = AtomicBool::new(false);
+        let req = Request { method: "GET", url: &url, headers: &[], body: None, cancel: Some(&cancel) };
+        let mut sink = Vec::new();
+        let mut bytes = 0;
+        let response = client.send(&req, Some(&mut sink), &mut |n| bytes += n).unwrap();
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_empty());
+        assert_eq!(sink, b"hello world");
+        assert_eq!(bytes, 11);
+
+        // A completed response's watcher must never close the socket after reuse.
+        cancel.store(true, Ordering::Relaxed);
+        let req = Request { cancel: None, ..req };
+        let response = client.send(&req, None, &mut |_| {}).unwrap();
+        assert_eq!(response.body, b"ok");
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     #[test]
